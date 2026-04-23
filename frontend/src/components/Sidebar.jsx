@@ -18,7 +18,7 @@ export default function Sidebar({
   return (
     <aside className="w-72 bg-gray-900 text-white">
       <div className="p-4 pb-2">
-        <div className="font-semibold text-lg">Workspace</div>
+        <div className="font-semibold text-lg">Accessibility Automation Pipeline</div>
         <div className="text-xs text-gray-300 mt-1">Dashboard and pipeline run history</div>
       </div>
       <div className="px-2 space-y-1">
