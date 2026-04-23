@@ -6,3 +6,5 @@ pydantic
 python-dotenv
 pdfservices-sdk
 requests
+PyPDF2
+openpyxl

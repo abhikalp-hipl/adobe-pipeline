@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html as _html
+from datetime import date
 from typing import Any
 
 
@@ -85,3 +86,65 @@ def build_pipeline_email(data: dict[str, Any]) -> str:
 """
 
     return html
+
+
+def build_eod_summary_email(data: dict[str, Any]) -> str:
+    def esc(value: Any) -> str:
+        return _html.escape("" if value is None else str(value))
+
+    report_date: date = data.get("date")
+    runs = data.get("runs") or []
+    totals = data.get("totals") or {}
+
+    rows = "".join(
+        [
+            f"""
+            <tr>
+              <td style="padding:8px;border-bottom:1px solid #eee;">{index + 1}</td>
+              <td style="padding:8px;border-bottom:1px solid #eee;">{esc(run.get('run_id'))}</td>
+              <td style="padding:8px;border-bottom:1px solid #eee;">{esc(run.get('total_files'))}</td>
+              <td style="padding:8px;border-bottom:1px solid #eee;color:green;">{esc(run.get('success_count'))}</td>
+              <td style="padding:8px;border-bottom:1px solid #eee;color:red;">{esc(run.get('failure_count'))}</td>
+              <td style="padding:8px;border-bottom:1px solid #eee;">{esc(run.get('status'))}</td>
+            </tr>
+            """
+            for index, run in enumerate(runs)
+        ]
+    )
+
+    if not rows:
+        rows = """
+        <tr>
+          <td colspan="6" style="padding:8px;border-bottom:1px solid #eee;color:#666;">No runs today.</td>
+        </tr>
+        """
+
+    return f"""
+<html>
+<body style="font-family: Arial, sans-serif; background:#f5f5f5; padding:20px;">
+  <div style="max-width:700px;margin:auto;background:white;padding:20px;border-radius:8px;">
+    <h2>Daily Pipeline Summary</h2>
+    <p style="color:#555;font-size:14px;">Date: {esc(report_date.isoformat() if report_date else '')}</p>
+    <hr/>
+    <h3>Overall</h3>
+    <p>Total Runs: {esc(totals.get('runs', 0))}</p>
+    <p>Total Files: {esc(totals.get('files', 0))}</p>
+    <p style="color:green;">Successful: {esc(totals.get('success', 0))}</p>
+    <p style="color:red;">Failed: {esc(totals.get('failure', 0))}</p>
+    <hr/>
+    <h3>Run-wise Summary</h3>
+    <table style="width:100%;border-collapse:collapse;">
+      <tr style="background:#f0f0f0;">
+        <th style="padding:8px;text-align:left;">#</th>
+        <th style="padding:8px;text-align:left;">Run ID</th>
+        <th style="padding:8px;text-align:left;">Files</th>
+        <th style="padding:8px;text-align:left;">Success</th>
+        <th style="padding:8px;text-align:left;">Failed</th>
+        <th style="padding:8px;text-align:left;">Status</th>
+      </tr>
+      {rows}
+    </table>
+  </div>
+</body>
+</html>
+"""

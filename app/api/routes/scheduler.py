@@ -1,6 +1,8 @@
 from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
+from app.db.database import SessionLocal
+from app.db.models import NotificationSettings
 from app.services.scheduler import Scheduler
 
 router = APIRouter(prefix="/scheduler", tags=["scheduler"])
@@ -54,6 +56,7 @@ def update_scheduler_interval(
             detail="Scheduler interval updates are disabled for OneDrive delegated mode.",
         )
     scheduler.update_interval(new_interval=payload.interval)
+    _persist_scheduler_interval(new_interval=payload.interval)
     return SchedulerStatusResponse(
         interval=scheduler.interval,
         status=scheduler.status(),
@@ -67,3 +70,21 @@ def run_scheduler_now(request: Request) -> RunNowResponse:
     scheduler = _get_scheduler(request=request)
     scheduler.run_once()
     return RunNowResponse(detail="Processing started")
+
+
+def _persist_scheduler_interval(new_interval: int) -> None:
+    db = SessionLocal()
+    try:
+        settings_row = db.query(NotificationSettings).order_by(NotificationSettings.created_at.asc()).first()
+        if not settings_row:
+            settings_row = NotificationSettings(
+                eod_time="18:00",
+                enabled=False,
+                scheduler_interval_seconds=new_interval,
+            )
+        else:
+            settings_row.scheduler_interval_seconds = new_interval
+        db.add(settings_row)
+        db.commit()
+    finally:
+        db.close()

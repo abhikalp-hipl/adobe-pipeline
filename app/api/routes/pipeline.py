@@ -1,15 +1,9 @@
-from datetime import UTC, datetime, timedelta
-
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect, status
 from pydantic import BaseModel
-from sqlalchemy.orm import Session
 
-from app.db.database import get_db
-from app.db.models import Document, DocumentStatus
 from app.services.scheduler import Scheduler
 
 router = APIRouter(tags=["pipeline"])
-ACTIVE_WINDOW_SECONDS = 120
 
 
 class PipelineStatusResponse(BaseModel):
@@ -43,75 +37,39 @@ def run_now(request: Request) -> RunNowResponse:
 
 
 @router.get("/pipeline/status", response_model=PipelineStatusResponse)
-def get_pipeline_status(request: Request, db: Session = Depends(get_db)) -> PipelineStatusResponse:
-    progress_map: dict[DocumentStatus, int] = {
-        DocumentStatus.UPLOADED: 10,
-        DocumentStatus.PROCESSING: 30,
-        DocumentStatus.TAGGED: 60,
-        DocumentStatus.CHECKED: 80,
-        DocumentStatus.COMPLETED: 100,
-        DocumentStatus.FAILED: 100,
-    }
-    running_statuses = (
-        DocumentStatus.UPLOADED,
-        DocumentStatus.PROCESSING,
-        DocumentStatus.TAGGED,
-        DocumentStatus.CHECKED,
-    )
-
-    current: Document | None = (
-        db.query(Document)
-        .filter(Document.status.in_(running_statuses))
-        .order_by(Document.updated_at.desc())
-        .first()
-    )
-    if current is None:
-        scheduler = getattr(request.app.state, "scheduler", None)
-        failure = getattr(scheduler, "last_failure", None) if scheduler else None
-        if (
-            failure
-            and failure.get("at")
-            and failure["at"] > datetime.now(UTC) - timedelta(seconds=ACTIVE_WINDOW_SECONDS)
-        ):
-            return PipelineStatusResponse(
-                is_running=False,
-                current_step="FAILED",
-                current_file=failure.get("current_file"),
-                progress=int(failure.get("progress") or 0),
-                error=failure.get("error"),
-                failed_step=failure.get("failed_step"),
-            )
-        # Surface a recent completion so the UI can toast success.
-        completed: Document | None = (
-            db.query(Document)
-            .filter(Document.status == DocumentStatus.COMPLETED)
-            .order_by(Document.updated_at.desc())
-            .first()
-        )
-        if completed is not None:
-            completed_updated = completed.updated_at
-            if completed_updated.tzinfo is None:
-                completed_updated = completed_updated.replace(tzinfo=UTC)
-            if completed_updated > datetime.now(UTC) - timedelta(seconds=ACTIVE_WINDOW_SECONDS):
-                return PipelineStatusResponse(
-                    is_running=False,
-                    current_step="COMPLETED",
-                    current_file=completed.filename,
-                    progress=100,
-                )
-        return PipelineStatusResponse(is_running=False, current_step=None, current_file=None, progress=0)
-
-    # Treat stale intermediate states as idle to avoid false "running" UI.
-    updated_at = current.updated_at
-    if updated_at.tzinfo is None:
-        updated_at = updated_at.replace(tzinfo=UTC)
-    if updated_at < datetime.now(UTC) - timedelta(seconds=ACTIVE_WINDOW_SECONDS):
-        return PipelineStatusResponse(is_running=False, current_step=None, current_file=None, progress=0)
-
+def get_pipeline_status(request: Request) -> PipelineStatusResponse:
+    scheduler = _get_scheduler(request=request)
+    status_payload = scheduler.get_pipeline_status()
     return PipelineStatusResponse(
-        is_running=True,
-        current_step=current.status.value,
-        current_file=current.filename,
-        progress=progress_map.get(current.status, 0),
+        is_running=bool(status_payload.get("is_running", False)),
+        current_step=status_payload.get("current_step"),
+        current_file=status_payload.get("current_file"),
+        progress=int(status_payload.get("progress") or 0),
+        error=status_payload.get("error"),
+        failed_step=status_payload.get("failed_step"),
     )
+
+
+@router.websocket("/ws/pipeline")
+async def pipeline_status_ws(websocket: WebSocket) -> None:
+    ws_manager = getattr(websocket.app.state, "pipeline_ws_manager", None)
+    scheduler = getattr(websocket.app.state, "scheduler", None)
+    if ws_manager is None or scheduler is None:
+        await websocket.close(code=1011)
+        return
+
+    await ws_manager.connect(websocket)
+    await websocket.send_json(
+        {
+            "type": "status",
+            **scheduler.get_pipeline_status(),
+        }
+    )
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        ws_manager.disconnect(websocket)
+    except Exception:
+        ws_manager.disconnect(websocket)
 

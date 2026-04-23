@@ -1,25 +1,51 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import {
+  AlertTriangle,
+  Calendar,
+  CheckCircle,
+  Code,
+  FileText,
+  Folder,
+  Play,
+  Table,
+  User,
+  XCircle,
+} from "lucide-react";
 
 import ExcelViewer from "../components/ExcelViewer";
 import ErrorPopup from "../components/ErrorPopup";
+import FileTable from "../components/FileTable";
+import DailyReportModal from "../components/DailyReportModal";
+import EmailModal from "../components/EmailModal";
+import Modal from "../components/Modal";
+import Navbar from "../components/Navbar";
+import Sidebar from "../components/Sidebar";
 import SuccessToast from "../components/SuccessToast";
 import {
+  addEmailGroup,
+  deleteEmailGroup,
   getFileContent,
   getFileContentArrayBuffer,
   getFilePreviewPdfUrl,
+  getEmailGroup,
   getFiles,
+  getRunFiles,
+  getRuns,
+  getSettings,
   getFileUrl,
   getScheduler,
   getPipelineStatus,
   runNow,
+  saveSettings,
+  normalizeRunFiles,
   updateScheduler,
 } from "../services/api";
 
 const FOLDERS = [
-  { key: "intake", label: "📥 Intake" },
-  { key: "processed", label: "📦 Processed Originals" },
-  { key: "output/success", label: "✅ Output Success" },
-  { key: "output/failure", label: "❌ Output Failure" },
+  { key: "intake", label: "Intake" },
+  { key: "processed", label: "Processed Originals" },
+  { key: "output/success", label: "Output Success" },
+  { key: "output/failure", label: "Output Failure" },
 ];
 
 const STATUS_CLASS = {
@@ -37,6 +63,56 @@ const EMPTY_SUMMARY = {
   skipped: 0,
   description: "",
 };
+
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const DASHBOARD_CACHE_TTL_MS = 60 * 1000;
+const RUN_FILES_CACHE_TTL_MS = 5 * 60 * 1000;
+const DASHBOARD_CACHE_KEYS = {
+  runs: "dashboard_runs_cache_v1",
+  dashboardFiles: "dashboard_files_cache_v1",
+  dashboardUpdatedAt: "dashboard_updated_at_cache_v1",
+  runFilesByRunId: "dashboard_run_files_by_id_cache_v1",
+};
+
+function readSessionCache(key, maxAgeMs, fallback) {
+  if (typeof window === "undefined") {
+    return fallback;
+  }
+  try {
+    const raw = window.sessionStorage.getItem(key);
+    if (!raw) {
+      return fallback;
+    }
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") {
+      return fallback;
+    }
+    const ts = Number(parsed.ts || 0);
+    if (!ts || Date.now() - ts > maxAgeMs) {
+      return fallback;
+    }
+    return parsed.value ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function writeSessionCache(key, value) {
+  if (typeof window === "undefined") {
+    return;
+  }
+  try {
+    window.sessionStorage.setItem(
+      key,
+      JSON.stringify({
+        ts: Date.now(),
+        value,
+      })
+    );
+  } catch {
+    // ignore cache write errors
+  }
+}
 
 function tryParseJson(value) {
   if (typeof value !== "string") {
@@ -82,7 +158,7 @@ function formatRelativeTime(iso) {
   if (!iso) {
     return "-";
   }
-  const date = new Date(iso);
+  const date = parseApiDate(iso);
   if (Number.isNaN(date.getTime())) {
     return "-";
   }
@@ -97,18 +173,42 @@ function formatRelativeTime(iso) {
   return `${diffDays}d ago`;
 }
 
+function parseApiDate(value) {
+  if (!value) {
+    return new Date("");
+  }
+  if (value instanceof Date) {
+    return value;
+  }
+  const raw = String(value).trim();
+  // If backend sends naive ISO datetime, treat it as UTC to avoid local-time misinterpretation.
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?$/.test(raw)) {
+    return new Date(`${raw}Z`);
+  }
+  return new Date(raw);
+}
+
+function formatLocalDateTime(value) {
+  const date = parseApiDate(value);
+  if (Number.isNaN(date.getTime())) {
+    return "-";
+  }
+  return date.toLocaleString();
+}
+
 function fileTypeIcon(file) {
   const name = (file?.name || "").toLowerCase();
   const mime = (file?.mime_type || "").toLowerCase();
-  if (name.endsWith(".pdf") || mime === "application/pdf") return "📄";
+  if (name.endsWith(".pdf") || mime === "application/pdf") return <FileText size={18} className="text-red-500" />;
   if (name.endsWith(".doc") || name.endsWith(".docx") || mime.includes("wordprocessingml") || mime === "application/msword")
-    return "📝";
-  if (name.endsWith(".xlsx") || mime.includes("spreadsheetml")) return "📊";
-  if (name.endsWith(".json") || mime === "application/json") return "🧾";
-  return "📁";
+    return <FileText size={18} className="text-blue-500" />;
+  if (name.endsWith(".xlsx") || mime.includes("spreadsheetml")) return <FileText size={18} className="text-emerald-500" />;
+  if (name.endsWith(".json") || mime === "application/json") return <FileText size={18} className="text-amber-500" />;
+  return <Folder size={18} className="text-gray-500" />;
 }
 
 function Dashboard() {
+  const [activePage, setActivePage] = useState("dashboard");
   const [selectedFolder, setSelectedFolder] = useState("intake");
   const [files, setFiles] = useState([]);
   const [selectedFile, setSelectedFile] = useState(null);
@@ -121,14 +221,17 @@ function Dashboard() {
   const [isViewerOpen, setIsViewerOpen] = useState(false);
   const [docPreviewUrl, setDocPreviewUrl] = useState("");
   const [showModal, setShowModal] = useState(false);
+  const [showReportModal, setShowReportModal] = useState(false);
   const [value, setValue] = useState(5);
   const [unit, setUnit] = useState("minutes");
   const [isCustom, setIsCustom] = useState(false);
-  const [isProcessing, setIsProcessing] = useState(false);
   const [isSavingSchedule, setIsSavingSchedule] = useState(false);
   const [pipelineStatus, setPipelineStatus] = useState(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [lastUpdatedAt, setLastUpdatedAt] = useState(null);
+  const [lastDashboardUpdatedAt, setLastDashboardUpdatedAt] = useState(
+    () => readSessionCache(DASHBOARD_CACHE_KEYS.dashboardUpdatedAt, DASHBOARD_CACHE_TTL_MS, null)
+  );
   const [folderCounts, setFolderCounts] = useState({
     intake: 0,
     processed: 0,
@@ -139,11 +242,41 @@ function Dashboard() {
   const [pipelineError, setPipelineError] = useState(null);
   const lastPipelineErrorKeyRef = useRef("");
   const [success, setSuccess] = useState(null);
+  const [emails, setEmails] = useState([]);
+  const [emailInput, setEmailInput] = useState("");
+  const [isSavingEmail, setIsSavingEmail] = useState(false);
+  const [deletingEmailId, setDeletingEmailId] = useState("");
+  const [emailToast, setEmailToast] = useState("");
+  const [showEmailModal, setShowEmailModal] = useState(false);
+  const [runs, setRuns] = useState(
+    () => readSessionCache(DASHBOARD_CACHE_KEYS.runs, DASHBOARD_CACHE_TTL_MS, [])
+  );
+  const [expandedRunId, setExpandedRunId] = useState("");
+  const [runFilesByRunId, setRunFilesByRunId] = useState(
+    () => readSessionCache(DASHBOARD_CACHE_KEYS.runFilesByRunId, RUN_FILES_CACHE_TTL_MS, {})
+  );
+  const [dashboardFiles, setDashboardFiles] = useState(
+    () => readSessionCache(DASHBOARD_CACHE_KEYS.dashboardFiles, DASHBOARD_CACHE_TTL_MS, [])
+  );
+  const [isLoadingDashboardFiles, setIsLoadingDashboardFiles] = useState(false);
+  const [isLoadingRuns, setIsLoadingRuns] = useState(false);
+  const [isLoadingRunFiles, setIsLoadingRunFiles] = useState(false);
+  const [runsPage, setRunsPage] = useState(1);
+  const [isRunNowPending, setIsRunNowPending] = useState(false);
+  const [settings, setSettings] = useState({ eod_time: "14:00", enabled: false });
+  const [eodTime, setEodTime] = useState("14:00");
+  const [isSavingSettings, setIsSavingSettings] = useState(false);
+  const [isLoadingReportSettings, setIsLoadingReportSettings] = useState(false);
+  const [viewer, setViewer] = useState(null);
+  const [viewerJson, setViewerJson] = useState(null);
+  const [viewerXlsx, setViewerXlsx] = useState(null);
+  const [isViewerLoading, setIsViewerLoading] = useState(false);
   const lastSuccessKeyRef = useRef("");
   const wasRunningRef = useRef(false);
 
   const intervalOptions = [1, 2, 5, 10, 15, 30, 60];
-  const isRunning = Boolean(pipelineStatus?.is_running) || isProcessing;
+  const isRunning = Boolean(pipelineStatus?.is_running);
+  const showRunningState = isRunning || isRunNowPending;
 
   useEffect(() => {
     const fetchFiles = async () => {
@@ -195,6 +328,160 @@ function Dashboard() {
     };
   }, []);
 
+  const refreshDashboard = async () => {
+    setIsLoadingDashboardFiles((dashboardFiles || []).length === 0);
+    try {
+      const data = await getRuns();
+      const nextRuns = Array.isArray(data) ? data : [];
+      setRuns(nextRuns);
+      writeSessionCache(DASHBOARD_CACHE_KEYS.runs, nextRuns);
+      if (nextRuns.length === 0) {
+        setDashboardFiles([]);
+        writeSessionCache(DASHBOARD_CACHE_KEYS.dashboardFiles, []);
+        const updatedAt = new Date().toISOString();
+        setLastDashboardUpdatedAt(updatedAt);
+        writeSessionCache(DASHBOARD_CACHE_KEYS.dashboardUpdatedAt, updatedAt);
+        return;
+      }
+      // Pull a wide window so older non-empty runs are still visible
+      // when several latest runs have zero processed files.
+      const candidateRuns = nextRuns.slice(0, 100);
+      const settledRows = await Promise.allSettled(candidateRuns.map((item) => getRunFiles(item.run_id)));
+      const successfulRows = settledRows
+        .filter((entry) => entry.status === "fulfilled")
+        .map((entry) => entry.value);
+      const normalized = successfulRows.flatMap((group) => normalizeRunFiles(group)).filter((item) => Boolean(item?.name));
+      normalized.sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
+      const nextDashboardFiles = normalized;
+      setDashboardFiles(nextDashboardFiles);
+      writeSessionCache(DASHBOARD_CACHE_KEYS.dashboardFiles, nextDashboardFiles);
+      const updatedAt = new Date().toISOString();
+      setLastDashboardUpdatedAt(updatedAt);
+      writeSessionCache(DASHBOARD_CACHE_KEYS.dashboardUpdatedAt, updatedAt);
+    } catch {
+      setError("Failed to refresh dashboard.");
+    } finally {
+      setIsLoadingDashboardFiles(false);
+    }
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    const fetchRuns = async () => {
+      setIsLoadingRuns((runs || []).length === 0);
+      try {
+        const data = await getRuns();
+        if (!cancelled) {
+          const nextRuns = Array.isArray(data) ? data : [];
+          setRuns(nextRuns);
+          writeSessionCache(DASHBOARD_CACHE_KEYS.runs, nextRuns);
+        }
+      } catch {
+        if (!cancelled) {
+          setError("Failed to fetch runs.");
+        }
+      } finally {
+        if (!cancelled) {
+          setIsLoadingRuns(false);
+        }
+      }
+    };
+    fetchRuns();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    refreshDashboard();
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const fetchSettings = async () => {
+      try {
+        const data = await getSettings();
+        if (!cancelled && data) {
+          setSettings({
+            eod_time: data.eod_time || "14:00",
+            enabled: Boolean(data.enabled),
+          });
+          setEodTime(data.eod_time || "14:00");
+        }
+      } catch {
+        if (!cancelled) {
+          setError("Failed to fetch notification settings.");
+        }
+      }
+    };
+    fetchSettings();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!showReportModal) {
+      return () => {
+        cancelled = true;
+      };
+    }
+    const syncReportSettings = async () => {
+      setIsLoadingReportSettings(true);
+      try {
+        const data = await getSettings();
+        if (!cancelled && data) {
+          setSettings({
+            eod_time: data.eod_time || "14:00",
+            enabled: Boolean(data.enabled),
+          });
+          setEodTime(data.eod_time || "14:00");
+        }
+      } catch {
+        if (!cancelled) {
+          setError("Failed to fetch notification settings.");
+        }
+      } finally {
+        if (!cancelled) {
+          setIsLoadingReportSettings(false);
+        }
+      }
+    };
+    syncReportSettings();
+    return () => {
+      cancelled = true;
+    };
+  }, [showReportModal]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const fetchEmails = async () => {
+      try {
+        const data = await getEmailGroup();
+        if (!cancelled) {
+          setEmails(Array.isArray(data) ? data : []);
+        }
+      } catch {
+        if (!cancelled) {
+          setError("Failed to fetch notification emails.");
+        }
+      }
+    };
+    fetchEmails();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!emailToast) {
+      return undefined;
+    }
+    const timer = window.setTimeout(() => setEmailToast(""), 2500);
+    return () => window.clearTimeout(timer);
+  }, [emailToast]);
+
   useEffect(() => {
     const handleClickOutside = (e) => {
       if (!e.target.closest("#profile-menu")) {
@@ -207,45 +494,98 @@ function Dashboard() {
 
   useEffect(() => {
     let isMounted = true;
+    let ws;
+    let reconnectTimer;
 
-    const fetchStatus = async () => {
-      try {
-        const data = await getPipelineStatus();
-        if (isMounted) {
-          const prevWasRunning = wasRunningRef.current;
-          const nextIsRunning = Boolean(data?.is_running);
-          setPipelineStatus(data);
-          setIsProcessing(Boolean(data?.is_running));
-          wasRunningRef.current = nextIsRunning;
-          if (data?.current_step === "FAILED") {
-            const key = `${data?.current_file || ""}|${data?.failed_step || ""}|${data?.error || ""}`;
-            if (key && key !== lastPipelineErrorKeyRef.current) {
-              lastPipelineErrorKeyRef.current = key;
-              setPipelineError({
-                message: data?.error || "Pipeline failed.",
-                file: data?.current_file || "",
-                step: data?.failed_step || "",
-              });
-            }
-          }
-          if (prevWasRunning && !nextIsRunning && data?.current_step === "COMPLETED") {
-            const key = `${data?.current_file || ""}|${data?.progress || 100}`;
-            if (key && key !== lastSuccessKeyRef.current) {
-              lastSuccessKeyRef.current = key;
-              setSuccess({ file: data?.current_file || "" });
-            }
+    const applyStatus = (data) => {
+      if (!isMounted || !data) {
+        return;
+      }
+      const prevWasRunning = wasRunningRef.current;
+      const nextIsRunning = Boolean(data?.is_running);
+      setPipelineStatus(data);
+      wasRunningRef.current = nextIsRunning;
+      if (nextIsRunning || data?.current_step === "COMPLETED" || data?.current_step === "FAILED") {
+        setIsRunNowPending(false);
+      }
+
+      if (data?.current_step === "FAILED") {
+        const key = `${data?.current_file || ""}|${data?.failed_step || ""}|${data?.error || ""}`;
+        if (key && key !== lastPipelineErrorKeyRef.current) {
+          lastPipelineErrorKeyRef.current = key;
+          setPipelineError({
+            message: data?.error || "Pipeline failed.",
+            file: data?.current_file || "",
+            step: data?.failed_step || "",
+          });
+        }
+      }
+
+      if (prevWasRunning && !nextIsRunning && data?.current_step === "COMPLETED") {
+        const key = `${data?.current_file || ""}|${data?.progress || 100}`;
+        if (key && key !== lastSuccessKeyRef.current) {
+          lastSuccessKeyRef.current = key;
+          setSuccess({ file: data?.current_file || "" });
+          refreshDashboard();
+          if (activePage === "folder") {
+            setSelectedFolder((prev) => prev);
           }
         }
-      } catch {
-        // ignore polling errors
       }
     };
 
-    fetchStatus();
-    const intervalId = setInterval(fetchStatus, 3000);
+    const connectWebSocket = () => {
+      const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+      ws = new WebSocket(`${protocol}://localhost:8000/ws/pipeline`);
+
+      ws.onopen = async () => {
+        // eslint-disable-next-line no-console
+        console.log("Connected to pipeline WebSocket");
+        try {
+          const initial = await getPipelineStatus();
+          applyStatus(initial);
+        } catch {
+          // ignore initial fetch errors
+        }
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const payload = JSON.parse(event.data);
+          if (payload?.type === "status") {
+            applyStatus(payload);
+            return;
+          }
+          if (payload?.type === "progress") {
+            applyStatus({
+              is_running: true,
+              current_file: payload?.file || "",
+              progress: Number(payload?.progress || 0),
+              current_step: payload?.current_step || "RUNNING",
+            });
+          }
+        } catch {
+          // ignore malformed messages
+        }
+      };
+
+      ws.onclose = () => {
+        if (!isMounted) {
+          return;
+        }
+        reconnectTimer = window.setTimeout(connectWebSocket, 2000);
+      };
+    };
+
+    connectWebSocket();
     return () => {
       isMounted = false;
-      clearInterval(intervalId);
+      if (reconnectTimer) {
+        window.clearTimeout(reconnectTimer);
+      }
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.close();
+      }
     };
   }, []);
 
@@ -366,30 +706,24 @@ function Dashboard() {
     unit === "hours" ? value * 3600 : unit === "minutes" ? value * 60 : value;
   const isSaveDisabled =
     isSavingSchedule ||
-    isProcessing ||
+    showRunningState ||
     value < 1 ||
     Number.isNaN(intervalSeconds) ||
     !Number.isFinite(intervalSeconds) ||
     intervalSeconds < 60;
 
   const handleRunNow = async () => {
-    setIsProcessing(true);
-    setPipelineStatus((prev) => ({
-      ...(prev || {}),
-      is_running: true,
-      current_step: prev?.current_step || "Starting…",
-      progress: typeof prev?.progress === "number" ? prev.progress : 0,
-    }));
+    setIsRunNowPending(true);
     try {
       await runNow();
+      const latest = await getPipelineStatus();
+      setPipelineStatus(latest);
+      if (!latest?.is_running) {
+        setIsRunNowPending(false);
+      }
     } catch (requestError) {
-      setPipelineStatus((prev) => ({
-        ...(prev || {}),
-        is_running: false,
-      }));
+      setIsRunNowPending(false);
       setError(requestError?.response?.data?.detail || "Failed to start processing.");
-    } finally {
-      setIsProcessing(false);
     }
   };
 
@@ -439,6 +773,145 @@ function Dashboard() {
     window.location.href = "/";
   };
 
+  const parsedEmailCandidates = useMemo(
+    () =>
+      emailInput
+        .split(",")
+        .map((item) => item.trim().toLowerCase())
+        .filter(Boolean),
+    [emailInput]
+  );
+
+  const invalidEmailCandidates = useMemo(
+    () => parsedEmailCandidates.filter((candidate) => !EMAIL_PATTERN.test(candidate)),
+    [parsedEmailCandidates]
+  );
+
+  const canAddEmails =
+    parsedEmailCandidates.length > 0 && invalidEmailCandidates.length === 0 && !isSavingEmail;
+
+  const handleAddEmails = async () => {
+    if (!canAddEmails) {
+      return;
+    }
+    setIsSavingEmail(true);
+    try {
+      const existingEmails = new Set((emails || []).map((item) => (item?.email || "").toLowerCase()));
+      const toCreate = parsedEmailCandidates.filter((email) => !existingEmails.has(email));
+      if (toCreate.length === 0) {
+        setEmailToast("All entered emails already exist.");
+        setEmailInput("");
+        return;
+      }
+      const createdRows = await Promise.all(toCreate.map((email) => addEmailGroup(email)));
+      setEmails((prev) => [...prev, ...createdRows]);
+      setEmailInput("");
+      setEmailToast(`Added ${createdRows.length} recipient${createdRows.length > 1 ? "s" : ""}.`);
+    } catch (requestError) {
+      setError(requestError?.response?.data?.detail || "Failed to add email.");
+    } finally {
+      setIsSavingEmail(false);
+    }
+  };
+
+  const handleDeleteEmail = async (id) => {
+    setDeletingEmailId(id);
+    try {
+      await deleteEmailGroup(id);
+      setEmails((prev) => prev.filter((item) => item.id !== id));
+      setEmailToast("Recipient removed.");
+    } catch (requestError) {
+      setError(requestError?.response?.data?.detail || "Failed to remove email.");
+    } finally {
+      setDeletingEmailId("");
+    }
+  };
+
+  const openFile = async (type, url, title) => {
+    const resolvedUrl = url && url.startsWith("http") ? url : `http://localhost:8000${url || ""}`;
+    setViewer({ type, url: resolvedUrl, title: title || "" });
+    setViewerJson(null);
+    setViewerXlsx(null);
+    if (!url) {
+      setIsViewerLoading(false);
+      return;
+    }
+    setIsViewerLoading(true);
+    if (type === "pdf") {
+      return;
+    }
+    try {
+      const parsed = new URL(resolvedUrl, window.location.origin);
+      const id = parsed.searchParams.get("id");
+      if (!id) {
+        throw new Error("Missing file id.");
+      }
+      if (type === "json") {
+        const content = await getFileContent(id);
+        setViewerJson(content);
+      } else if (type === "xlsx") {
+        const buffer = await getFileContentArrayBuffer(id);
+        setViewerXlsx(buffer);
+      }
+    } catch {
+      setError("Failed to open output file.");
+    } finally {
+      setIsViewerLoading(false);
+    }
+  };
+
+  const closeRunOutputViewer = () => {
+    setViewer(null);
+    setViewerJson(null);
+    setViewerXlsx(null);
+    setIsViewerLoading(false);
+  };
+
+  const handleRunRowClick = async (runId) => {
+    if (expandedRunId === runId) {
+      setExpandedRunId("");
+      return;
+    }
+    setExpandedRunId(runId);
+    if (runFilesByRunId[runId]) {
+      return;
+    }
+    setIsLoadingRunFiles(true);
+    try {
+      const files = await getRunFiles(runId);
+      const normalizedFiles = normalizeRunFiles(files);
+      setRunFilesByRunId((prev) => {
+        const next = { ...prev, [runId]: normalizedFiles };
+        writeSessionCache(DASHBOARD_CACHE_KEYS.runFilesByRunId, next);
+        return next;
+      });
+    } catch {
+      setError("Failed to fetch run file details.");
+    } finally {
+      setIsLoadingRunFiles(false);
+    }
+  };
+
+  const handleSaveSettings = async () => {
+    setIsSavingSettings(true);
+    try {
+      const payload = { ...settings, eod_time: eodTime };
+      const data = await saveSettings(payload);
+      setSettings({
+        eod_time: data?.eod_time || settings.eod_time,
+        enabled: Boolean(data?.enabled),
+      });
+      setEodTime(data?.eod_time || eodTime);
+      setEmailToast("Notification settings saved.");
+      return true;
+    } catch (requestError) {
+      setError(requestError?.response?.data?.detail || "Failed to save settings.");
+      return false;
+    } finally {
+      setIsSavingSettings(false);
+    }
+  };
+
   const isPdfSelected =
     selectedFile?.name?.toLowerCase().endsWith(".pdf") || selectedFile?.mime_type === "application/pdf";
   const isJsonSelected =
@@ -482,6 +955,13 @@ function Dashboard() {
 
   const fileCount = (files || []).length;
   const filteredCount = (filteredFiles || []).length;
+  const dashboardLastUpdatedLabel = lastDashboardUpdatedAt ? formatRelativeTime(lastDashboardUpdatedAt) : "-";
+  const runsPageSize = 20;
+  const runsTotalPages = Math.max(1, Math.ceil((runs?.length || 0) / runsPageSize));
+  const paginatedRuns = useMemo(
+    () => (runs || []).slice((runsPage - 1) * runsPageSize, runsPage * runsPageSize),
+    [runs, runsPage]
+  );
 
   const jsonSections = useMemo(() => {
     if (!fileContent || typeof fileContent !== "object" || Array.isArray(fileContent)) {
@@ -494,211 +974,340 @@ function Dashboard() {
     return Object.entries(detailed).filter(([, value]) => Array.isArray(value));
   }, [fileContent]);
 
+  const viewerSummary = useMemo(() => {
+    if (!viewerJson || typeof viewerJson !== "object" || Array.isArray(viewerJson)) {
+      return EMPTY_SUMMARY;
+    }
+    const rawSummary = viewerJson.Summary;
+    if (!rawSummary || typeof rawSummary !== "object") {
+      return EMPTY_SUMMARY;
+    }
+    return {
+      passed: Number(rawSummary.Passed || 0),
+      failed: Number(rawSummary.Failed || 0),
+      needsManual: Number(rawSummary["Needs manual check"] || 0),
+      passedManually: Number(rawSummary["Passed manually"] || 0),
+      failedManually: Number(rawSummary["Failed manually"] || 0),
+      skipped: Number(rawSummary.Skipped || 0),
+      description: rawSummary.Description || "",
+    };
+  }, [viewerJson]);
+
+  const viewerJsonSections = useMemo(() => {
+    if (!viewerJson || typeof viewerJson !== "object" || Array.isArray(viewerJson)) {
+      return [];
+    }
+    const detailed = viewerJson["Detailed Report"];
+    if (!detailed || typeof detailed !== "object" || Array.isArray(detailed)) {
+      return [];
+    }
+    return Object.entries(detailed).filter(([, value]) => Array.isArray(value));
+  }, [viewerJson]);
+
+  useEffect(() => {
+    setRunsPage(1);
+  }, [runs]);
+
+  useEffect(() => {
+    if (runsPage > runsTotalPages) {
+      setRunsPage(runsTotalPages);
+    }
+  }, [runsPage, runsTotalPages]);
+
   return (
     <div className="flex h-screen">
-      <aside className="w-72 bg-gray-900 text-white">
-        <div className="p-4">
-          <div className="font-semibold text-lg">Files</div>
-          <div className="text-xs text-gray-300 mt-1">Browse intake, processed originals, and output folders</div>
-        </div>
-        <div className="px-2 space-y-1">
-          {FOLDERS.map((folder) => (
-            <div
-              key={folder.key}
-              className={`p-2 rounded cursor-pointer flex items-center justify-between hover:bg-gray-800 ${
-                selectedFolder === folder.key ? "bg-blue-600 text-white" : "text-gray-200"
-              }`}
-              onClick={() => setSelectedFolder(folder.key)}
-              role="button"
-              tabIndex={0}
-              onKeyDown={(event) => event.key === "Enter" && setSelectedFolder(folder.key)}
-            >
-              <span className="text-sm">{folder.label}</span>
-              <span
-                className={`text-xs px-2 py-0.5 rounded-full ${
-                  selectedFolder === folder.key ? "bg-white/20" : "bg-white/10"
-                }`}
-              >
-                {folderCounts?.[folder.key] ?? 0}
-              </span>
-            </div>
-          ))}
-        </div>
-      </aside>
+      <Sidebar
+        activePage={activePage}
+        setActivePage={setActivePage}
+        selectedFolder={selectedFolder}
+        setSelectedFolder={setSelectedFolder}
+        folderCounts={folderCounts}
+      />
 
       <main className="flex-1 p-6 bg-gray-100 overflow-y-auto">
-        <div className="flex justify-between items-center mb-6">
-          <h1 className="text-2xl font-semibold text-gray-900">Dashboard</h1>
-          <div className="flex items-center gap-3">
-            <div className="hidden md:flex items-center gap-2 bg-white border rounded-lg px-3 py-2">
-              <span
-                className={`w-2.5 h-2.5 rounded-full ${
-                  isRunning ? "bg-blue-500 animate-pulse" : "bg-emerald-500"
-                }`}
-              />
-              <span className="text-sm text-gray-700">
-                {isRunning ? "Running" : "Idle"}
-              </span>
-            </div>
-            <button
-              type="button"
-              onClick={handleRunNow}
-              disabled={isProcessing}
-              className={`px-4 py-2 rounded text-white ${
-                isProcessing ? "bg-blue-300 cursor-not-allowed" : "bg-blue-600 hover:bg-blue-700"
-              }`}
-            >
-              {isProcessing ? (
-                <span className="flex items-center gap-2">
-                  <span className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
-                  Running...
-                </span>
-              ) : (
-                "Run Now"
-              )}
-            </button>
-            <button
-              type="button"
-              onClick={() => setShowModal(true)}
-              disabled={isProcessing}
-              className={`px-4 py-2 rounded text-white ml-2 ${
-                isProcessing ? "bg-gray-400 cursor-not-allowed" : "bg-gray-800 hover:bg-gray-900"
-              }`}
-            >
-              Schedule
-            </button>
+        <Navbar
+          activePage={activePage}
+          isRunning={showRunningState}
+          onRunNow={handleRunNow}
+          onOpenSchedule={() => setShowModal(true)}
+          onOpenEmailModal={() => setShowEmailModal(true)}
+          emailCount={emails.length}
+          showProfileMenu={showProfileMenu}
+          setShowProfileMenu={setShowProfileMenu}
+          onLogout={handleLogout}
+        />
 
-            {isRunning ? (
-              <div className="hidden md:flex items-center gap-3 ml-2">
-                <span className="w-3 h-3 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
-                <span className="text-sm text-gray-700 max-w-[240px] truncate">
-                  Processing: {pipelineStatus?.current_file || "…"}
-                </span>
-                <div className="w-40 h-2 bg-gray-200 rounded">
-                  <div
-                    className="h-2 bg-blue-500 rounded"
-                    style={{
-                      width: `${Math.min(100, Math.max(0, pipelineStatus?.progress || 0))}%`,
-                    }}
-                  />
-                </div>
-                <span className="text-xs text-gray-500">{pipelineStatus?.current_step || ""}</span>
+        {activePage === "dashboard" && (
+          <FileTable
+            isLoadingDashboardFiles={isLoadingDashboardFiles}
+            dashboardFiles={dashboardFiles}
+            openFile={openFile}
+            lastUpdatedLabel={dashboardLastUpdatedLabel}
+          />
+        )}
+
+        {activePage === "folder" && (
+          <section className="bg-white shadow rounded-xl p-4">
+            <div className="flex items-start justify-between gap-4 mb-4">
+              <div>
+                <h2 className="text-lg font-semibold capitalize">
+                  {selectedFolder} Files{" "}
+                  <span className="text-sm font-normal text-gray-500">
+                    ({filteredCount}{searchQuery ? ` of ${fileCount}` : ""})
+                  </span>
+                </h2>
+                <p className="text-xs text-gray-500 mt-1">
+                  Last updated: {lastUpdatedAt ? formatRelativeTime(lastUpdatedAt) : "-"}
+                </p>
               </div>
-            ) : null}
+              <div className="w-full max-w-sm">
+                <input
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  placeholder="Search files..."
+                  className="w-full border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-200"
+                />
+              </div>
+            </div>
+            {isLoadingFiles && (
+              <div className="flex items-center gap-2 text-sm text-gray-500 mb-2">
+                <span className="inline-block w-4 h-4 border-2 border-gray-300 border-t-gray-600 rounded-full animate-spin" />
+                Loading...
+              </div>
+            )}
+            {!isLoadingFiles && filteredFiles.length === 0 && (
+              <div className="border border-dashed rounded-xl p-8 text-center bg-gray-50">
+                <div className="text-lg font-semibold text-gray-800">No files found</div>
+                <div className="text-sm text-gray-500 mt-1">
+                  {searchQuery ? "Try a different search term." : "This folder is currently empty."}
+                </div>
+              </div>
+            )}
+            <div className="space-y-2">
+              {filteredFiles.map((file) => (
+                <div key={file.id} className="group flex items-center justify-between p-3 rounded-lg border bg-white hover:bg-gray-50 hover:border-gray-300 transition cursor-pointer" onClick={() => handleFileSelect(file)} role="button" tabIndex={0} onKeyDown={(event) => event.key === "Enter" && handleFileSelect(file)}>
+                  <div className="flex items-center gap-3 min-w-0">
+                    <div className="w-9 h-9 rounded-lg bg-gray-100 flex items-center justify-center text-lg">{fileTypeIcon(file)}</div>
+                    <div className="min-w-0">
+                      <div className="text-sm font-medium text-gray-900 break-all">{file.name}</div>
+                      <div className="text-xs text-gray-500 flex items-center gap-3 mt-0.5">
+                        <span className="uppercase">{(file?.mime_type || "file").split("/").pop() || "file"}</span>
+                        <span>•</span>
+                        <span>{formatRelativeTime(file?.last_modified)}</span>
+                        <span>•</span>
+                        <span>{formatBytes(file?.size_bytes)}</span>
+                      </div>
+                    </div>
+                  </div>
+                  <div className="hidden sm:flex gap-2 opacity-0 group-hover:opacity-100 transition">
+                    <button type="button" onClick={(e) => { e.stopPropagation(); handleFileSelect(file); }} className="px-3 py-1.5 rounded bg-blue-600 hover:bg-blue-700 text-white text-sm">View</button>
+                    <a href={getFileUrl(file.id)} download={file.name} onClick={(e) => e.stopPropagation()} className="px-3 py-1.5 rounded bg-gray-800 hover:bg-gray-900 text-white text-sm">Download</a>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </section>
+        )}
 
-            <div className="relative" id="profile-menu">
-              <button
-                type="button"
-                onClick={() => setShowProfileMenu((prev) => !prev)}
-                className="ml-2 w-10 h-10 rounded-full bg-gray-200 flex items-center justify-center hover:bg-gray-300"
-                aria-label="Profile menu"
-              >
-                👤
-              </button>
-              {showProfileMenu && (
-                <div className="absolute right-0 mt-2 w-40 bg-white shadow-lg rounded-lg border z-50">
+        {activePage === "runs" && (
+          <>
+            <section className="bg-white shadow rounded-xl p-4">
+              <div className="flex justify-between items-center mb-4">
+                <div>
+                  <h2 className="text-lg font-semibold">Run History</h2>
+                  <p className="text-xs text-gray-500">Report: {settings?.enabled ? `Daily at ${eodTime}` : "Disabled"}</p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setShowReportModal(true)}
+                  className="btn-secondary flex items-center gap-2"
+                >
+                  <FileText size={16} />
+                  Daily Report
+                </button>
+              </div>
+              {isLoadingRuns ? (
+                <p className="text-sm text-gray-500">Loading runs...</p>
+              ) : runs.length === 0 ? (
+                <p className="text-sm text-gray-500">No runs available.</p>
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm border">
+                    <thead className="bg-gray-50">
+                      <tr>
+                        <th className="text-left p-2 border">Run ID</th>
+                        <th className="text-left p-2 border">Time</th>
+                        <th className="text-left p-2 border">Duration</th>
+                        <th className="text-left p-2 border">Files</th>
+                        <th className="text-left p-2 border">Success</th>
+                        <th className="text-left p-2 border">Failed</th>
+                        <th className="text-left p-2 border">Status</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {paginatedRuns.map((run) => {
+                        const runFiles = runFilesByRunId[run.run_id] || [];
+                        const isExpanded = expandedRunId === run.run_id;
+                        return (
+                          <React.Fragment key={run.run_id}>
+                            <tr
+                              className="cursor-pointer hover:bg-gray-50"
+                              onClick={() => handleRunRowClick(run.run_id)}
+                            >
+                              <td className="p-2 border break-all">{run.run_id}</td>
+                              <td className="p-2 border">{formatLocalDateTime(run.start_time)}</td>
+                              <td className="p-2 border">{run.duration || "-"}</td>
+                              <td className="p-2 border">{run.total_files ?? 0}</td>
+                              <td className="p-2 border text-green-600 font-medium">{run.success_count ?? 0}</td>
+                              <td className="p-2 border text-red-600 font-medium">{run.failure_count ?? 0}</td>
+                              <td className="p-2 border">
+                                <span
+                                  className={`px-2 py-1 rounded text-xs inline-flex items-center gap-2 ${
+                                    run.status === "COMPLETED"
+                                      ? "bg-green-100 text-green-700"
+                                      : "bg-red-100 text-red-700"
+                                  }`}
+                                >
+                                  {run.status === "COMPLETED" ? <CheckCircle size={14} /> : <XCircle size={14} />}
+                                  {run.status}
+                                </span>
+                              </td>
+                            </tr>
+                            {isExpanded && (
+                              <tr>
+                                <td colSpan={7} className="p-2 border bg-gray-50">
+                                  {isLoadingRunFiles && !runFilesByRunId[run.run_id] ? (
+                                    <p className="text-xs text-gray-500">Loading file details...</p>
+                                  ) : runFiles.length === 0 ? (
+                                    <p className="text-xs text-gray-500">No file details found.</p>
+                                  ) : (
+                                    <table className="w-full text-xs border bg-white">
+                                      <thead className="bg-gray-50">
+                                        <tr>
+                                          <th className="text-left p-2 border">File Name</th>
+                                          <th className="text-left p-2 border">Status</th>
+                                          <th className="text-left p-2 border">Accessibility</th>
+                                          <th className="text-left p-2 border">Outputs</th>
+                                        </tr>
+                                      </thead>
+                                      <tbody>
+                                        {runFiles.map((file, idx) => (
+                                          <tr key={`${run.run_id}-${idx}`} className="border-t align-top">
+                                            {(() => {
+                                              const isFailed = file?.status === "FAILED";
+                                              const canOpenPdf = Boolean(file?.outputs?.pdf_url) && !isFailed;
+                                              const canOpenJson = Boolean(file?.outputs?.json_url) && !isFailed;
+                                              const canOpenXlsx = Boolean(file?.outputs?.xlsx_url) && !isFailed;
+                                              const unavailableTitle = isFailed ? "Not available for failed files" : "Output not available";
+                                              return (
+                                                <>
+                                                  <td className="p-2 border break-all">{file.name}</td>
+                                                  <td className="p-2 border">
+                                                    <span className={`px-2 py-1 text-xs rounded inline-flex ${
+                                                      file.status === "COMPLETED" ? "bg-green-100 text-green-700" : "bg-red-100 text-red-700"
+                                                    }`}>
+                                                      {file.status || "UNKNOWN"}
+                                                    </span>
+                                                  </td>
+                                                  <td className="p-2 border text-gray-500">
+                                                    <div className="flex gap-2 text-xs">
+                                                      <span className="text-green-600">{"\u2714"} {file.accessibility?.passed || 0}</span>
+                                                      <span className="text-red-600">{"\u2716"} {file.accessibility?.failed || 0}</span>
+                                                      <span className="text-yellow-600">{"\u26A0"} {file.accessibility?.manual || 0}</span>
+                                                    </div>
+                                                  </td>
+                                                  <td className="p-2 border">
+                                                    <div className="flex gap-2">
+                                                      <button
+                                                        type="button"
+                                                        title={canOpenPdf ? "View Tagged PDF" : unavailableTitle}
+                                                        disabled={!canOpenPdf}
+                                                        onClick={(event) => {
+                                                          event.stopPropagation();
+                                                          openFile("pdf", file?.outputs?.pdf_url, "Tagged PDF");
+                                                        }}
+                                                        className="px-2 py-1 text-xs bg-gray-100 rounded hover:bg-gray-200 disabled:opacity-40 disabled:cursor-not-allowed inline-flex items-center gap-1"
+                                                      >
+                                                        <FileText size={14} />
+                                                        Tagged PDF
+                                                      </button>
+                                                      <button
+                                                        type="button"
+                                                        title={canOpenJson ? "View Accessibility Report" : unavailableTitle}
+                                                        disabled={!canOpenJson}
+                                                        onClick={(event) => {
+                                                          event.stopPropagation();
+                                                          openFile("json", file?.outputs?.json_url, "Accessibility Report");
+                                                        }}
+                                                        className="px-2 py-1 text-xs bg-gray-100 rounded hover:bg-gray-200 disabled:opacity-40 disabled:cursor-not-allowed inline-flex items-center gap-1"
+                                                      >
+                                                        <Code size={14} />
+                                                        Accessibility Report
+                                                      </button>
+                                                      <button
+                                                        type="button"
+                                                        title={canOpenXlsx ? "View Tagging Report" : unavailableTitle}
+                                                        disabled={!canOpenXlsx}
+                                                        onClick={(event) => {
+                                                          event.stopPropagation();
+                                                          openFile("xlsx", file?.outputs?.xlsx_url, "Tagging Report");
+                                                        }}
+                                                        className="px-2 py-1 text-xs bg-gray-100 rounded hover:bg-gray-200 disabled:opacity-40 disabled:cursor-not-allowed inline-flex items-center gap-1"
+                                                      >
+                                                        <Table size={14} />
+                                                        Tagging Report
+                                                      </button>
+                                                    </div>
+                                                    {!canOpenPdf &&
+                                                      !canOpenJson &&
+                                                      !canOpenXlsx && (
+                                                        <span className="text-gray-400 text-xs mt-1 inline-block">No outputs available</span>
+                                                      )}
+                                                  </td>
+                                                </>
+                                              );
+                                            })()}
+                                          </tr>
+                                        ))}
+                                      </tbody>
+                                    </table>
+                                  )}
+                                </td>
+                              </tr>
+                            )}
+                          </React.Fragment>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+              {!isLoadingRuns && runs.length > 0 && (
+                <div className="flex justify-between items-center mt-4">
                   <button
                     type="button"
-                    onClick={handleLogout}
-                    className="w-full text-left px-4 py-2 hover:bg-gray-100 text-sm"
+                    disabled={runsPage === 1}
+                    onClick={() => setRunsPage((prev) => prev - 1)}
+                    className="px-3 py-1 text-sm rounded bg-gray-100 hover:bg-gray-200 disabled:opacity-40 disabled:cursor-not-allowed"
                   >
-                    Logout
+                    Prev
+                  </button>
+                  <span className="text-sm text-gray-600">
+                    Page {runsPage} of {runsTotalPages}
+                  </span>
+                  <button
+                    type="button"
+                    disabled={runsPage >= runsTotalPages}
+                    onClick={() => setRunsPage((prev) => prev + 1)}
+                    className="px-3 py-1 text-sm rounded bg-gray-100 hover:bg-gray-200 disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    Next
                   </button>
                 </div>
               )}
-            </div>
-          </div>
-        </div>
-
-        <section className="bg-white shadow rounded-xl p-4">
-          <div className="flex items-start justify-between gap-4 mb-4">
-            <div>
-              <h2 className="text-lg font-semibold capitalize">
-                {selectedFolder} Files{" "}
-                <span className="text-sm font-normal text-gray-500">
-                  ({filteredCount}{searchQuery ? ` of ${fileCount}` : ""})
-                </span>
-              </h2>
-              <p className="text-xs text-gray-500 mt-1">
-                Last updated: {lastUpdatedAt ? formatRelativeTime(lastUpdatedAt) : "-"}
-              </p>
-            </div>
-            <div className="w-full max-w-sm">
-              <input
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="Search files..."
-                className="w-full border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-200"
-              />
-            </div>
-          </div>
-          {isLoadingFiles && (
-            <div className="flex items-center gap-2 text-sm text-gray-500 mb-2">
-              <span className="inline-block w-4 h-4 border-2 border-gray-300 border-t-gray-600 rounded-full animate-spin" />
-              Loading...
-            </div>
-          )}
-          {!isLoadingFiles && filteredFiles.length === 0 && (
-            <div className="border border-dashed rounded-xl p-8 text-center bg-gray-50">
-              <div className="text-lg font-semibold text-gray-800">No files found</div>
-              <div className="text-sm text-gray-500 mt-1">
-                {searchQuery ? "Try a different search term." : "This folder is currently empty."}
-              </div>
-            </div>
-          )}
-          {error && <p className="text-sm text-red-600 mb-2">{error}</p>}
-          <div className="space-y-2">
-            {filteredFiles.map((file) => (
-              <div
-                key={file.id}
-                className="group flex items-center justify-between p-3 rounded-lg border bg-white hover:bg-gray-50 hover:border-gray-300 transition cursor-pointer"
-                onClick={() => handleFileSelect(file)}
-                role="button"
-                tabIndex={0}
-                onKeyDown={(event) => event.key === "Enter" && handleFileSelect(file)}
-              >
-                <div className="flex items-center gap-3 min-w-0">
-                  <div className="w-9 h-9 rounded-lg bg-gray-100 flex items-center justify-center text-lg">
-                    {fileTypeIcon(file)}
-                  </div>
-                  <div className="min-w-0">
-                    <div className="text-sm font-medium text-gray-900 break-all">{file.name}</div>
-                    <div className="text-xs text-gray-500 flex items-center gap-3 mt-0.5">
-                      <span className="uppercase">{(file?.mime_type || "file").split("/").pop() || "file"}</span>
-                      <span>•</span>
-                      <span>{formatRelativeTime(file?.last_modified)}</span>
-                      <span>•</span>
-                      <span>{formatBytes(file?.size_bytes)}</span>
-                    </div>
-                  </div>
-                </div>
-
-                <div className="flex items-center gap-2">
-                  <div className="hidden sm:flex gap-2 opacity-0 group-hover:opacity-100 transition">
-                    <button
-                      type="button"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        handleFileSelect(file);
-                      }}
-                      className="px-3 py-1.5 rounded bg-blue-600 hover:bg-blue-700 text-white text-sm"
-                    >
-                      View
-                    </button>
-                    <a
-                      href={getFileUrl(file.id)}
-                      download={file.name}
-                      onClick={(e) => e.stopPropagation()}
-                      className="px-3 py-1.5 rounded bg-gray-800 hover:bg-gray-900 text-white text-sm"
-                    >
-                      Download
-                    </a>
-                  </div>
-                </div>
-              </div>
-            ))}
-          </div>
-        </section>
+            </section>
+          </>
+        )}
       </main>
 
       {showModal && (
@@ -794,7 +1403,7 @@ function Dashboard() {
 
       {isViewerOpen && selectedFile && (
         <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
-          <div className="bg-white rounded-xl shadow-xl w-full max-w-6xl max-h-[90vh] overflow-y-auto p-4">
+          <div className="bg-white rounded-xl shadow-xl w-full max-w-[96vw] max-h-[94vh] overflow-y-auto p-4">
             <div className="flex items-center justify-between mb-4">
               <h2 className="text-lg font-semibold break-all pr-4">{selectedFile.name}</h2>
               <button
@@ -876,8 +1485,15 @@ function Dashboard() {
 
             {isJsonSelected && (
               <div>
-                {(isLoadingContent || isOpeningFile) && <p className="text-sm text-gray-500">Loading report...</p>}
-                {!isLoadingContent && (
+                {(isLoadingContent || isOpeningFile) && (
+                  <div className="min-h-[60vh] flex items-center justify-center">
+                    <div className="flex items-center gap-2 text-sm text-gray-600">
+                      <span className="inline-block w-4 h-4 border-2 border-gray-300 border-t-gray-600 rounded-full animate-spin" />
+                      Loading accessibility report...
+                    </div>
+                  </div>
+                )}
+                {!isLoadingContent && !isOpeningFile && (
                   <>
                     <div className="bg-white rounded-xl shadow p-4 mb-4 border">
                       {summary.description && (
@@ -961,8 +1577,15 @@ function Dashboard() {
 
             {isXlsxSelected && (
               <div>
-                {(isLoadingContent || isOpeningFile) && <p className="text-sm text-gray-500">Loading Excel...</p>}
-                {!isLoadingContent && <ExcelViewer data={xlsxContent} />}
+                {(isLoadingContent || isOpeningFile) && (
+                  <div className="min-h-[60vh] flex items-center justify-center">
+                    <div className="flex items-center gap-2 text-sm text-gray-600">
+                      <span className="inline-block w-4 h-4 border-2 border-gray-300 border-t-gray-600 rounded-full animate-spin" />
+                      Loading tagging report...
+                    </div>
+                  </div>
+                )}
+                {!isLoadingContent && !isOpeningFile && <ExcelViewer data={xlsxContent} />}
               </div>
             )}
 
@@ -975,6 +1598,152 @@ function Dashboard() {
         </div>
       )}
 
+      <Modal open={Boolean(viewer)} onClose={closeRunOutputViewer} title={viewer?.title || `${viewer?.type || "Output"} Viewer`} sizeClass="w-[95vw] h-[92vh]">
+        {isViewerLoading && viewer?.type !== "pdf" && (
+          <div className="h-full min-h-[60vh] flex items-center justify-center">
+            <div className="flex items-center gap-2 text-sm text-gray-600">
+              <span className="inline-block w-4 h-4 border-2 border-gray-300 border-t-gray-600 rounded-full animate-spin" />
+              Loading {viewer?.title ? viewer.title.toLowerCase() : "output"}...
+            </div>
+          </div>
+        )}
+        {viewer?.type === "pdf" && (
+          <div className="relative w-full h-full min-h-[60vh]">
+            <iframe
+              src={viewer.url}
+              title="Output PDF"
+              className="w-full h-full rounded border"
+              onLoad={() => setIsViewerLoading(false)}
+              onError={() => setIsViewerLoading(false)}
+            />
+            {isViewerLoading && (
+              <div className="absolute inset-0 bg-white/80 flex items-center justify-center rounded">
+                <div className="flex items-center gap-2 text-sm text-gray-600">
+                  <span className="inline-block w-4 h-4 border-2 border-gray-300 border-t-gray-600 rounded-full animate-spin" />
+                  Loading tagged pdf...
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+        {!isViewerLoading && viewer?.type === "json" && (
+          <div>
+            <div className="bg-white rounded-xl shadow p-4 mb-4 border">
+              {viewerSummary.description && (
+                <p className="text-sm text-slate-700 mb-3">{viewerSummary.description}</p>
+              )}
+              <div className="flex gap-3 flex-wrap">
+                <span className="px-2 py-1 rounded bg-green-100 text-green-700 text-sm">
+                  Passed: {viewerSummary.passed}
+                </span>
+                <span className="px-2 py-1 rounded bg-red-100 text-red-700 text-sm">
+                  Failed: {viewerSummary.failed}
+                </span>
+                <span className="px-2 py-1 rounded bg-yellow-100 text-yellow-700 text-sm">
+                  Needs manual check: {viewerSummary.needsManual}
+                </span>
+                <span className="px-2 py-1 rounded bg-emerald-100 text-emerald-700 text-sm">
+                  Passed manually: {viewerSummary.passedManually}
+                </span>
+                <span className="px-2 py-1 rounded bg-rose-100 text-rose-700 text-sm">
+                  Failed manually: {viewerSummary.failedManually}
+                </span>
+                <span className="px-2 py-1 rounded bg-gray-200 text-gray-700 text-sm">
+                  Skipped: {viewerSummary.skipped}
+                </span>
+              </div>
+            </div>
+
+            {viewerJsonSections.length === 0 && (
+              <pre className="text-xs bg-gray-50 rounded p-3 overflow-auto h-full">
+                {JSON.stringify(viewerJson || {}, null, 2)}
+              </pre>
+            )}
+
+            {viewerJsonSections.map(([sectionTitle, sectionValue]) => {
+              const rows = Array.isArray(sectionValue) ? sectionValue : [sectionValue];
+              return (
+                <div key={sectionTitle} className="mb-6">
+                  <h3 className="font-semibold text-lg mb-2 capitalize">{sectionTitle}</h3>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-sm border">
+                      <thead className="bg-gray-50">
+                        <tr>
+                          <th className="text-left p-2 border">Rule</th>
+                          <th className="text-left p-2 border">Status</th>
+                          <th className="text-left p-2 border">Description</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {rows.map((entry, index) => {
+                          const normalizedEntry = normalizeReportEntry(entry);
+                          const statusValue = (normalizedEntry.status || "unknown").toString();
+                          const normalizedStatus = statusValue.toLowerCase();
+                          const statusClass =
+                            STATUS_CLASS[normalizedStatus] ||
+                            (normalizedStatus.includes("manual")
+                              ? STATUS_CLASS["needs manual check"]
+                              : "text-gray-700");
+                          return (
+                            <tr key={`${sectionTitle}-${index}`} className="border-t">
+                              <td className="p-2 border">
+                                {normalizedEntry.rule || `Rule ${index + 1}`}
+                              </td>
+                              <td className={`p-2 border font-medium ${statusClass}`}>{statusValue}</td>
+                              <td className="p-2 border">
+                                {normalizedEntry.description ||
+                                  (typeof entry === "string" ? entry : JSON.stringify(entry))}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+        {!isViewerLoading && viewer?.type === "xlsx" && <ExcelViewer data={viewerXlsx} />}
+      </Modal>
+
+      <EmailModal
+        open={showEmailModal}
+        onClose={() => setShowEmailModal(false)}
+        emails={emails}
+        emailInput={emailInput}
+        setEmailInput={setEmailInput}
+        canAddEmails={canAddEmails}
+        isSavingEmail={isSavingEmail}
+        invalidEmailCandidates={invalidEmailCandidates}
+        handleAddEmails={handleAddEmails}
+        handleDeleteEmail={handleDeleteEmail}
+        deletingEmailId={deletingEmailId}
+      />
+
+      <DailyReportModal
+        open={showReportModal}
+        onClose={() => setShowReportModal(false)}
+        enabled={Boolean(settings.enabled)}
+        onToggleEnabled={(enabled) =>
+          setSettings((prev) => ({
+            ...prev,
+            enabled,
+          }))
+        }
+        time={eodTime}
+        onTimeChange={(value) => setEodTime(value || "14:00")}
+        onSave={async () => {
+          const isSaved = await handleSaveSettings();
+          if (isSaved) {
+            setShowReportModal(false);
+          }
+        }}
+        isSaving={isSavingSettings}
+        isLoadingSettings={isLoadingReportSettings}
+      />
+
       <ErrorPopup
         error={pipelineError}
         onClose={() => setPipelineError(null)}
@@ -985,6 +1754,11 @@ function Dashboard() {
       />
 
       {success && <SuccessToast success={success} onDismiss={() => setSuccess(null)} />}
+      {emailToast && (
+        <div className="fixed bottom-5 right-5 bg-green-500 text-white px-4 py-3 rounded-lg shadow-lg z-50 text-sm">
+          {emailToast}
+        </div>
+      )}
     </div>
   );
 }

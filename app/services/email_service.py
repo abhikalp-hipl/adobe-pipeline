@@ -2,6 +2,8 @@ import logging
 import os
 import smtplib
 import ssl
+from email import encoders
+from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
@@ -31,7 +33,12 @@ def _int_from_env(name: str, default: int | None = None) -> int:
         raise EmailServiceError(f"Invalid integer value for {name}: {raw!r}") from exc
 
 
-def send_email(to_email: str, subject: str, html_content: str) -> None:
+def send_email(
+    to_email: str,
+    subject: str,
+    html_content: str,
+    attachments: list[tuple[str, bytes, str]] | None = None,
+) -> None:
     """
     Send a single HTML email using SMTP + STARTTLS.
 
@@ -54,6 +61,13 @@ def send_email(to_email: str, subject: str, html_content: str) -> None:
 
     part = MIMEText(html_content, "html")
     msg.attach(part)
+    for filename, content_bytes, mime_type in attachments or []:
+        main_type, _, sub_type = mime_type.partition("/")
+        attachment = MIMEBase(main_type or "application", sub_type or "octet-stream")
+        attachment.set_payload(content_bytes)
+        encoders.encode_base64(attachment)
+        attachment.add_header("Content-Disposition", f'attachment; filename="{filename}"')
+        msg.attach(attachment)
 
     try:
         if insecure_tls:

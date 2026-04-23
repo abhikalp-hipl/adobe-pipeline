@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from pathlib import Path
 from urllib.parse import quote
@@ -179,3 +180,125 @@ class OneDriveClient:
                 f"status={response.status_code} body={response.text}"
             )
         return response
+
+
+def _request_with_retry(
+    method: str,
+    url: str,
+    access_token: str,
+    *,
+    timeout_seconds: int,
+    json_payload: dict | None = None,
+) -> requests.Response:
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+    }
+    if json_payload is not None:
+        headers["Content-Type"] = "application/json"
+
+    last_error: Exception | None = None
+    for attempt in range(2):
+        try:
+            response = requests.request(
+                method=method,
+                url=url,
+                headers=headers,
+                json=json_payload,
+                timeout=timeout_seconds,
+            )
+            if response.status_code >= 500 and attempt == 0:
+                logger.warning(
+                    "Transient Graph API error, retrying once: method=%s url=%s status=%s",
+                    method,
+                    url,
+                    response.status_code,
+                )
+                continue
+            return response
+        except RequestException as exc:
+            last_error = exc
+            if attempt == 0:
+                logger.warning(
+                    "Graph API request failed, retrying once: method=%s url=%s error=%s",
+                    method,
+                    url,
+                    exc,
+                )
+                continue
+            raise OneDriveError(f"Microsoft Graph request failed: {method} {url}") from exc
+
+    if last_error:
+        raise OneDriveError(f"Microsoft Graph request failed: {method} {url}") from last_error
+    raise OneDriveError(f"Microsoft Graph request failed: {method} {url}")
+
+
+async def ensure_folder(path: str, access_token: str, timeout_seconds: int = 30) -> None:
+    token = OneDriveClient._require_token(access_token)
+    parts = [part.strip() for part in path.split("/") if part.strip()]
+    current_path = ""
+
+    for part in parts:
+        current_path = f"{current_path}/{part}" if current_path else part
+        check_url = f"https://graph.microsoft.com/v1.0/me/drive/root:/{current_path}"
+        check_response = await asyncio.to_thread(
+            _request_with_retry,
+            "GET",
+            check_url,
+            token,
+            timeout_seconds=timeout_seconds,
+        )
+
+        if check_response.status_code == 404:
+            parent = "/".join(current_path.split("/")[:-1])
+            create_url = (
+                "https://graph.microsoft.com/v1.0/me/drive/root/children"
+                if not parent
+                else f"https://graph.microsoft.com/v1.0/me/drive/root:/{parent}:/children"
+            )
+            create_response = await asyncio.to_thread(
+                _request_with_retry,
+                "POST",
+                create_url,
+                token,
+                timeout_seconds=timeout_seconds,
+                json_payload={
+                    "name": part,
+                    "folder": {},
+                    "@microsoft.graph.conflictBehavior": "replace",
+                },
+            )
+            if create_response.status_code >= 400:
+                raise OneDriveError(
+                    "Failed to create OneDrive folder "
+                    f"'{current_path}': status={create_response.status_code} body={create_response.text}"
+                )
+            logger.info("Ensured OneDrive folder by creating it: path=%s", current_path)
+            continue
+
+        if check_response.status_code >= 400:
+            raise OneDriveError(
+                "Failed to verify OneDrive folder "
+                f"'{current_path}': status={check_response.status_code} body={check_response.text}"
+            )
+
+
+async def ensure_pipeline_folders(access_token: str, timeout_seconds: int = 30) -> None:
+    folders = [
+        "AdobePipeline",
+        INTAKE_FOLDER,
+        PROCESSED_FOLDER,
+        OUTPUT_SUCCESS_FOLDER,
+        OUTPUT_FAILURE_FOLDER,
+    ]
+    for folder in folders:
+        try:
+            await ensure_folder(folder, access_token, timeout_seconds=timeout_seconds)
+        except Exception:
+            logger.exception("Failed to ensure OneDrive folder: path=%s", folder)
+
+
+def ensure_pipeline_folders_sync(access_token: str, timeout_seconds: int = 30) -> None:
+    try:
+        asyncio.run(ensure_pipeline_folders(access_token, timeout_seconds=timeout_seconds))
+    except Exception:
+        logger.exception("Failed to ensure required OneDrive pipeline folders.")

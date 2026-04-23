@@ -1,0 +1,39 @@
+.btn-primary {
+  @apply bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700 transition;
+}
+
+.btn-secondary {
+  @apply bg-white text-gray-700 border border-gray-300 px-4 py-2 rounded-lg hover:bg-gray-50 transition;
+}
+
+.btn-disabled {
+  @apply bg-gray-300 text-gray-600 cursor-not-allowed hover:bg-gray-300;
+}
+
+.card {
+  @apply bg-white rounded-xl shadow p-4;
+}
+
+.input {
+  @apply border rounded px-3 py-2 w-full;
+}
+
+.table-row {
+  @apply flex items-center justify-between px-4 py-3 border-b hover:bg-gray-50 cursor-pointer;
+}
+
+.status-success {
+  @apply text-green-600 flex items-center gap-1;
+}
+
+.status-failed {
+  @apply text-red-600 flex items-center gap-1;
+}
+
+.sidebar-item {
+  @apply w-full flex items-center justify-between px-3 py-2 rounded-lg hover:bg-gray-800 cursor-pointer transition-colors text-left;
+}
+
+.sidebar-active {
+  @apply bg-blue-600 text-white;
+}

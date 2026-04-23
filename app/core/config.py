@@ -36,6 +36,7 @@ class Settings:
     MS_TENANT_ID: str = _str_from_env("MS_TENANT_ID", "")
     MS_REDIRECT_URI: str = _str_from_env("MS_REDIRECT_URI", "http://localhost:8000/auth/callback")
     FRONTEND_DASHBOARD_URL: str = _str_from_env("FRONTEND_DASHBOARD_URL", "http://localhost:3000/dashboard")
+    MAX_PDF_SIZE_MB: int = _int_from_env("MAX_PDF_SIZE_MB", 100)
 
 
 settings = Settings()

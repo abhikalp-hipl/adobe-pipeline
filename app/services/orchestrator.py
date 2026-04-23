@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.db.models import Document, DocumentStatus
 from app.services.adobe.client import AdobeClient
+from app.services.precheck import validate_pdf
 
 logger = logging.getLogger(__name__)
 
@@ -49,9 +50,9 @@ class Orchestrator:
         failed_step = "start"
         original_name = self._derive_original_name(document.filename, intake_path.name)
         base_name = Path(original_name).stem
-        tagged_output_path = OUTPUT_SUCCESS_DIR / f"{base_name}_tagged.pdf"
-        report_output_path = OUTPUT_SUCCESS_DIR / f"{base_name}_report.json"
-        xlsx_report_output_path = OUTPUT_SUCCESS_DIR / f"{base_name}_report.xlsx"
+        tagged_output_path = OUTPUT_SUCCESS_DIR / f"{base_name}_tagged_pdf.pdf"
+        report_output_path = OUTPUT_SUCCESS_DIR / f"{base_name}_accessibility_report.json"
+        xlsx_report_output_path = OUTPUT_SUCCESS_DIR / f"{base_name}_tagged_report.xlsx"
         try:
             self._set_status(document, DocumentStatus.PROCESSING)
             logger.info("Step status update: document_id=%s status=%s", document.id, DocumentStatus.PROCESSING.value)
@@ -66,6 +67,17 @@ class Orchestrator:
                         intake_path,
                         output_dir=Path(temp_dir),
                     )
+                    failed_step = "precheck"
+                    precheck = validate_pdf(pdf_path)
+                    if not precheck.get("valid", False):
+                        message = str(precheck.get("reason") or "PDF precheck failed.")
+                        logger.warning(
+                            "Step precheck failed: document_id=%s type=%s reason=%s",
+                            document.id,
+                            precheck.get("type", ""),
+                            message,
+                        )
+                        raise OrchestratorError(message)
                     # Step 1: auto-tag.
                     failed_step = "auto_tag"
                     logger.info("Step auto_tag start: document_id=%s input=%s", document.id, pdf_path)
@@ -82,6 +94,17 @@ class Orchestrator:
                         xlsx_report_output_path = autotag_report_path.replace(xlsx_report_output_path)
             else:
                 logger.info("Step convert_to_pdf skipped: document_id=%s input already pdf", document.id)
+                failed_step = "precheck"
+                precheck = validate_pdf(pdf_path)
+                if not precheck.get("valid", False):
+                    message = str(precheck.get("reason") or "PDF precheck failed.")
+                    logger.warning(
+                        "Step precheck failed: document_id=%s type=%s reason=%s",
+                        document.id,
+                        precheck.get("type", ""),
+                        message,
+                    )
+                    raise OrchestratorError(message)
 
                 # Step 1: auto-tag.
                 failed_step = "auto_tag"

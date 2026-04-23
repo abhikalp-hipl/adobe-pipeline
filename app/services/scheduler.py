@@ -3,19 +3,32 @@ import threading
 import uuid
 import json
 import hashlib
+from io import BytesIO
 from pathlib import Path
+from collections import Counter
+from typing import Callable
 
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy import func
+from openpyxl import Workbook
 
-from datetime import datetime, UTC
+from datetime import date, datetime, UTC
 from datetime import timedelta
 
 from app.core.config import settings
 from app.db.database import SessionLocal
-from app.db.models import Document, DocumentStatus, UserToken
+from app.db.models import (
+    Document,
+    DocumentStatus,
+    EmailGroup,
+    NotificationSettings,
+    PipelineRun,
+    PipelineRunFile,
+    PipelineRunStatus,
+)
 from app.services.auth.microsoft_auth import MicrosoftAuthError, MicrosoftAuthService
 from app.services.email_service import EmailServiceError, send_email
-from app.services.email_templates import build_pipeline_email
+from app.services.email_templates import build_eod_summary_email, build_pipeline_email
 from app.services.orchestrator import Orchestrator, OrchestratorError
 from app.services.storage.onedrive import (
     INTAKE_FOLDER,
@@ -25,6 +38,7 @@ from app.services.storage.onedrive import (
     OneDriveClient,
     OneDriveError,
     OneDriveNotFoundError,
+    ensure_pipeline_folders_sync,
 )
 
 logger = logging.getLogger(__name__)
@@ -38,7 +52,7 @@ GENERATED_MARKERS = (".converted", ".tagged", "report")
 
 
 class Scheduler:
-    def __init__(self, interval: int | None = None) -> None:
+    def __init__(self, interval: int | None = None, status_listener: Callable[[dict[str, object]], None] | None = None) -> None:
         configured_interval = interval or settings.SCHEDULER_INTERVAL_SECONDS
         self.interval = max(1, configured_interval)
         self.max_files_per_cycle = max(1, settings.MAX_FILES_PER_CYCLE)
@@ -48,9 +62,20 @@ class Scheduler:
         self.auth_service = MicrosoftAuthService() if self.storage_provider == "onedrive" else None
         self.onedrive_client = OneDriveClient() if self.storage_provider == "onedrive" else None
         self._thread: threading.Thread | None = None
+        self._eod_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._wakeup_event = threading.Event()
         self.last_failure: dict | None = None
+        self._status_listener = status_listener
+        self._status_lock = threading.Lock()
+        self.pipeline_status: dict[str, object] = {
+            "is_running": False,
+            "current_step": None,
+            "current_file": None,
+            "progress": 0,
+            "error": None,
+            "failed_step": None,
+        }
 
     def _record_failure(self, *, filename: str, failed_step: str, error: str, progress: int) -> None:
         self.last_failure = {
@@ -60,6 +85,56 @@ class Scheduler:
             "error": error,
             "progress": progress,
         }
+        self._set_pipeline_status(
+            current_step="FAILED",
+            current_file=filename,
+            progress=int(max(0, min(100, progress))),
+            error=error,
+            failed_step=failed_step,
+        )
+
+    def _set_pipeline_status(self, **updates: object) -> None:
+        snapshot: dict[str, object]
+        with self._status_lock:
+            self.pipeline_status.update(updates)
+            snapshot = dict(self.pipeline_status)
+        if self._status_listener:
+            try:
+                self._status_listener(snapshot)
+            except Exception:
+                logger.exception("Failed to publish pipeline status update")
+
+    def _mark_pipeline_started(self) -> None:
+        self._set_pipeline_status(
+            is_running=True,
+            current_step="RUNNING",
+            current_file=None,
+            progress=0,
+            error=None,
+            failed_step=None,
+        )
+
+    def _mark_pipeline_progress(self, *, filename: str, progress: int) -> None:
+        self._set_pipeline_status(
+            is_running=True,
+            current_step="RUNNING",
+            current_file=filename,
+            progress=int(max(0, min(99, progress))),
+            error=None,
+            failed_step=None,
+        )
+
+    def _mark_pipeline_finished(self, *, success: bool) -> None:
+        self._set_pipeline_status(
+            is_running=False,
+            current_step="COMPLETED" if success else "FAILED",
+            current_file=None,
+            progress=0,
+        )
+
+    def get_pipeline_status(self) -> dict[str, object]:
+        with self._status_lock:
+            return dict(self.pipeline_status)
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -69,7 +144,9 @@ class Scheduler:
         INTAKE_DIR.mkdir(parents=True, exist_ok=True)
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._run_loop, name="document-scheduler", daemon=True)
+        self._eod_thread = threading.Thread(target=self._run_eod_loop, name="eod-scheduler", daemon=True)
         self._thread.start()
+        self._eod_thread.start()
         logger.info(
             "Scheduler started: interval=%s seconds storage_provider=%s",
             self.interval,
@@ -80,6 +157,8 @@ class Scheduler:
         self._stop_event.set()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=5)
+        if self._eod_thread and self._eod_thread.is_alive():
+            self._eod_thread.join(timeout=5)
         logger.info("Scheduler stopped")
 
     def status(self) -> str:
@@ -94,14 +173,17 @@ class Scheduler:
         self._wakeup_event.set()
 
     def run_once(self) -> None:
+        self._mark_pipeline_started()
         run_id = str(uuid.uuid4())
         started_at = datetime.now(UTC)
         logger.info("Manual scheduler run started: run_id=%s", run_id)
+        run_db_id = self._create_pipeline_run(run_id=run_id, start_time=started_at)
 
         files_summary: list[dict[str, str]] = []
         access_passed = 0
         access_failed = 0
         access_manual = 0
+        run_failed = False
 
         try:
             if self.storage_provider == "onedrive":
@@ -118,12 +200,28 @@ class Scheduler:
                 access_passed = int(access.get("passed", 0))
                 access_failed = int(access.get("failed", 0))
                 access_manual = int(access.get("manual", 0))
+        except Exception:
+            run_failed = True
+            raise
         finally:
             finished_at = datetime.now(UTC)
             duration = self._format_duration(finished_at - started_at)
             total_files = len(files_summary)
             success_count = sum(1 for item in files_summary if item.get("status") == DocumentStatus.COMPLETED.value)
             failure_count = sum(1 for item in files_summary if item.get("status") == DocumentStatus.FAILED.value)
+            final_status = PipelineRunStatus.FAILED if run_failed else PipelineRunStatus.COMPLETED
+
+            if run_db_id:
+                self._store_pipeline_run_files(run_db_id=run_db_id, files_summary=files_summary)
+                self._finalize_pipeline_run(
+                    run_db_id=run_db_id,
+                    end_time=finished_at,
+                    duration=duration,
+                    total_files=total_files,
+                    success_count=success_count,
+                    failure_count=failure_count,
+                    status=final_status,
+                )
 
             run_data = {
                 "run_id": run_id,
@@ -139,34 +237,54 @@ class Scheduler:
             }
 
             try:
-                to_email = self._get_latest_user_email()
-                if not to_email:
-                    logger.info("Skipping email notification (no user email found): run_id=%s", run_id)
+                recipient_emails = self._get_notification_emails()
+                if not recipient_emails:
+                    logger.info("Skipping email notification (no configured recipients): run_id=%s", run_id)
                 else:
                     if failure_count == 0:
                         subject = f"✅ Pipeline Completed | {total_files} Files"
                     else:
                         subject = f"❌ Pipeline Completed with Errors | {failure_count} Failed"
                     html_content = build_pipeline_email(run_data)
-                    send_email(to_email=to_email, subject=subject, html_content=html_content)
-                    logger.info("Pipeline summary email sent: run_id=%s to=%s", run_id, to_email)
+                    for recipient in recipient_emails:
+                        send_email(to_email=recipient, subject=subject, html_content=html_content)
+                    logger.info(
+                        "Pipeline summary email sent: run_id=%s recipients=%s",
+                        run_id,
+                        ",".join(recipient_emails),
+                    )
             except EmailServiceError:
                 logger.exception("Email notification failed: run_id=%s", run_id)
             except Exception:
                 logger.exception("Unexpected error while sending email: run_id=%s", run_id)
 
+            self._mark_pipeline_finished(success=not run_failed)
             logger.info("Manual scheduler run finished: run_id=%s duration=%s", run_id, duration)
 
     def _run_loop(self) -> None:
         while not self._stop_event.is_set():
+            signaled = self._wakeup_event.wait(self.interval)
+            if self._stop_event.is_set():
+                break
+            if signaled:
+                # Wakeups are used to apply scheduler config changes immediately,
+                # not to force an immediate processing run.
+                self._wakeup_event.clear()
+                continue
             logger.info("Scheduler polling cycle started")
             try:
                 self.run_once()
             except Exception:
                 logger.exception("Scheduler polling cycle failed")
             logger.info("Scheduler polling cycle ended")
-            self._wakeup_event.wait(self.interval)
-            self._wakeup_event.clear()
+
+    def _run_eod_loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                self._maybe_send_eod_summary()
+            except Exception:
+                logger.exception("EOD summary check failed")
+            self._stop_event.wait(60)
 
     def _poll_local_intake_folder(self) -> dict:
         candidate_files: list[Path] = []
@@ -196,6 +314,11 @@ class Scheduler:
         access_manual = 0
 
         for index, file_path in enumerate(process_batch):
+            total_files = max(1, len(process_batch))
+            self._mark_pipeline_progress(
+                filename=file_path.name,
+                progress=int((index / total_files) * 100),
+            )
             result = self._register_and_trigger(file_path=file_path, source_id=None)
             if result:
                 files_summary.append(
@@ -224,6 +347,11 @@ class Scheduler:
             raise OneDriveError("OneDrive client is not initialized.")
         if not self.auth_service:
             raise MicrosoftAuthError("Microsoft auth service is not initialized.")
+
+        try:
+            ensure_pipeline_folders_sync(self._get_onedrive_access_token())
+        except Exception:
+            logger.exception("Failed to ensure required OneDrive pipeline folders before intake processing.")
 
         try:
             all_files = self.onedrive_client.list_files(
@@ -289,6 +417,11 @@ class Scheduler:
             file_id = remote_file["id"]
             filename = Path(remote_file["name"]).name
             local_path = INTAKE_DIR / f"{file_id}_{filename}"
+            total_files = max(1, len(process_batch))
+            self._mark_pipeline_progress(
+                filename=filename,
+                progress=int((index / total_files) * 100),
+            )
             try:
                 self.onedrive_client.download_file(
                     access_token=self._get_onedrive_access_token(),
@@ -586,18 +719,237 @@ class Scheduler:
             return {"passed": 0, "failed": 0, "manual": 0}
 
     @staticmethod
-    def _get_latest_user_email() -> str:
+    def _get_notification_emails() -> list[str]:
         db = SessionLocal()
         try:
-            token_row = db.query(UserToken).order_by(UserToken.updated_at.desc()).first()
-            if not token_row or not token_row.user_email:
-                return ""
-            return token_row.user_email
+            rows = db.query(EmailGroup.email).order_by(EmailGroup.created_at.asc()).all()
+            emails = [row[0].strip().lower() for row in rows if row and row[0]]
+            deduped = list(dict.fromkeys(emails))
+            return deduped
         except Exception:
-            logger.exception("Failed to resolve notification email address")
+            logger.exception("Failed to resolve notification email list")
+            return []
+        finally:
+            db.close()
+
+    @staticmethod
+    def _create_pipeline_run(run_id: str, start_time: datetime) -> str:
+        db = SessionLocal()
+        try:
+            row = PipelineRun(run_id=run_id, start_time=start_time, status=PipelineRunStatus.COMPLETED)
+            db.add(row)
+            db.commit()
+            db.refresh(row)
+            return row.id
+        except Exception:
+            db.rollback()
+            logger.exception("Failed to create pipeline run row: run_id=%s", run_id)
             return ""
         finally:
             db.close()
+
+    @staticmethod
+    def _store_pipeline_run_files(run_db_id: str, files_summary: list[dict[str, str]]) -> None:
+        if not run_db_id or not files_summary:
+            return
+        db = SessionLocal()
+        try:
+            for item in files_summary:
+                file_status = item.get("status")
+                status = PipelineRunStatus.COMPLETED if file_status == DocumentStatus.COMPLETED.value else PipelineRunStatus.FAILED
+                db.add(
+                    PipelineRunFile(
+                        run_id=run_db_id,
+                        file_name=str(item.get("name") or ""),
+                        status=status,
+                        error_message=str(item.get("error") or ""),
+                    )
+                )
+            db.commit()
+        except Exception:
+            db.rollback()
+            logger.exception("Failed to store pipeline run file rows: run_db_id=%s", run_db_id)
+        finally:
+            db.close()
+
+    @staticmethod
+    def _finalize_pipeline_run(
+        run_db_id: str,
+        end_time: datetime,
+        duration: str,
+        total_files: int,
+        success_count: int,
+        failure_count: int,
+        status: PipelineRunStatus,
+    ) -> None:
+        if not run_db_id:
+            return
+        db = SessionLocal()
+        try:
+            row = db.query(PipelineRun).filter(PipelineRun.id == run_db_id).first()
+            if not row:
+                return
+            row.end_time = end_time
+            row.duration = duration
+            row.total_files = int(total_files)
+            row.success_count = int(success_count)
+            row.failure_count = int(failure_count)
+            row.status = status
+            db.add(row)
+            db.commit()
+        except Exception:
+            db.rollback()
+            logger.exception("Failed to finalize pipeline run row: run_db_id=%s", run_db_id)
+        finally:
+            db.close()
+
+    def _maybe_send_eod_summary(self) -> None:
+        db = SessionLocal()
+        try:
+            settings_row = db.query(NotificationSettings).order_by(NotificationSettings.created_at.asc()).first()
+            if not settings_row:
+                settings_row = NotificationSettings(eod_time="18:00", enabled=False)
+                db.add(settings_row)
+                db.commit()
+                db.refresh(settings_row)
+
+            if not settings_row.enabled:
+                return
+
+            now = datetime.now()
+            current_hhmm = now.strftime("%H:%M")
+            if current_hhmm != settings_row.eod_time:
+                return
+
+            today = now.date()
+            if settings_row.last_sent_date == today:
+                return
+
+            day_start = datetime.combine(today, datetime.min.time())
+            day_end = day_start + timedelta(days=1)
+            runs = (
+                db.query(PipelineRun)
+                .filter(PipelineRun.created_at >= day_start, PipelineRun.created_at < day_end)
+                .order_by(PipelineRun.start_time.asc())
+                .all()
+            )
+            total_runs = len(runs)
+            total_files = sum(int(item.total_files or 0) for item in runs)
+            total_success = sum(int(item.success_count or 0) for item in runs)
+            total_failure = sum(int(item.failure_count or 0) for item in runs)
+
+            run_rows = [
+                {
+                    "run_id": item.run_id,
+                    "start_time": item.start_time,
+                    "total_files": item.total_files,
+                    "success_count": item.success_count,
+                    "failure_count": item.failure_count,
+                    "duration": item.duration,
+                    "status": item.status.value,
+                }
+                for item in runs
+            ]
+
+            # Optional enrichment: common error from today's failures.
+            failure_messages = (
+                db.query(PipelineRunFile.error_message, func.count(PipelineRunFile.id))
+                .join(PipelineRun, PipelineRun.id == PipelineRunFile.run_id)
+                .filter(
+                    PipelineRun.created_at >= day_start,
+                    PipelineRun.created_at < day_end,
+                    PipelineRunFile.status == PipelineRunStatus.FAILED,
+                    PipelineRunFile.error_message != "",
+                )
+                .group_by(PipelineRunFile.error_message)
+                .all()
+            )
+            if failure_messages:
+                common_error = Counter({msg: count for msg, count in failure_messages}).most_common(1)[0][0]
+            else:
+                common_error = ""
+
+            payload = {
+                "date": today,
+                "runs": run_rows,
+                "totals": {"runs": total_runs, "files": total_files, "success": total_success, "failure": total_failure},
+                "common_error": common_error,
+            }
+            subject = f"📊 Daily Pipeline Summary | {today.isoformat()}"
+            html_content = build_eod_summary_email(payload)
+            attachment_name = f"daily_pipeline_summary_{today.isoformat()}.xlsx"
+            attachment_bytes = self._build_eod_summary_xlsx(
+                report_date=today,
+                runs=run_rows,
+                totals={
+                    "runs": total_runs,
+                    "files": total_files,
+                    "success": total_success,
+                    "failure": total_failure,
+                },
+            )
+            recipients = self._get_notification_emails()
+            if not recipients:
+                logger.info("Skipping EOD summary email: no recipients")
+            else:
+                for recipient in recipients:
+                    send_email(
+                        to_email=recipient,
+                        subject=subject,
+                        html_content=html_content,
+                        attachments=[
+                            (
+                                attachment_name,
+                                attachment_bytes,
+                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            )
+                        ],
+                    )
+                logger.info("EOD summary sent: date=%s recipients=%s", today.isoformat(), ",".join(recipients))
+
+            settings_row.last_sent_date = today
+            db.add(settings_row)
+            db.commit()
+        except EmailServiceError:
+            db.rollback()
+            logger.exception("Failed to send EOD summary email")
+        except Exception:
+            db.rollback()
+            logger.exception("Failed during EOD summary processing")
+        finally:
+            db.close()
+
+    @staticmethod
+    def _build_eod_summary_xlsx(
+        report_date: date,
+        runs: list[dict[str, object]],
+        totals: dict[str, int],
+    ) -> bytes:
+        workbook = Workbook()
+        runs_sheet = workbook.active
+        runs_sheet.title = "Runs"
+        runs_sheet.append(["Run ID", "Time", "Duration", "Files", "Success", "Failed", "Status"])
+        for run in runs:
+            start_time_raw = run.get("start_time")
+            if isinstance(start_time_raw, datetime):
+                start_time_value = start_time_raw.isoformat()
+            else:
+                start_time_value = str(start_time_raw or "")
+            runs_sheet.append(
+                [
+                    str(run.get("run_id") or ""),
+                    start_time_value,
+                    str(run.get("duration") or "-"),
+                    int(run.get("total_files") or 0),
+                    int(run.get("success_count") or 0),
+                    int(run.get("failure_count") or 0),
+                    str(run.get("status") or ""),
+                ]
+            )
+
+        output = BytesIO()
+        workbook.save(output)
+        return output.getvalue()
 
     def _upload_onedrive_outputs(
         self,

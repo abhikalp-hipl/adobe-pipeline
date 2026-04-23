@@ -8,6 +8,7 @@ from app.core.config import settings
 from app.db.database import get_db
 from app.db.models import UserToken
 from app.services.auth.microsoft_auth import MicrosoftAuthError, MicrosoftAuthService
+from app.services.storage.onedrive import ensure_pipeline_folders_sync
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 logger = logging.getLogger(__name__)
@@ -53,6 +54,7 @@ def microsoft_callback(
     try:
         token_payload = auth_service.exchange_code_for_tokens(code=code)
         auth_service.save_tokens(db=db, payload=token_payload)
+        ensure_pipeline_folders_sync(token_payload.access_token)
         logger.info(
             "Microsoft login success: tenant_id=%s user_email=%s",
             token_payload.tenant_id,
