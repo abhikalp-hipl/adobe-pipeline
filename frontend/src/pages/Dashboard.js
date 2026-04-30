@@ -68,11 +68,13 @@ const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const DASHBOARD_CACHE_TTL_MS = 60 * 1000;
 const RUN_FILES_CACHE_TTL_MS = 5 * 60 * 1000;
 const FOLDER_FILES_CACHE_TTL_MS = 30 * 1000;
+const FOLDER_FILES_STORAGE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const DASHBOARD_CACHE_KEYS = {
   runs: "dashboard_runs_cache_v1",
   dashboardFiles: "dashboard_files_cache_v1",
   dashboardUpdatedAt: "dashboard_updated_at_cache_v1",
   runFilesByRunId: "dashboard_run_files_by_id_cache_v1",
+  folderFilesByFolder: "dashboard_folder_files_cache_v1",
 };
 
 function readSessionCache(key, maxAgeMs, fallback) {
@@ -279,7 +281,9 @@ function Dashboard() {
   const lastTerminalRefreshAtRef = useRef(0);
   const runFilesByRunIdRef = useRef(runFilesByRunId);
   const folderFetchRequestIdRef = useRef(0);
-  const folderFilesCacheRef = useRef({});
+  const folderFilesCacheRef = useRef(
+    readSessionCache(DASHBOARD_CACHE_KEYS.folderFilesByFolder, FOLDER_FILES_STORAGE_MAX_AGE_MS, {})
+  );
 
   const intervalOptions = [1, 2, 5, 10, 15, 30, 60];
   const isRunning = Boolean(pipelineStatus?.is_running);
@@ -304,6 +308,38 @@ function Dashboard() {
     }
   }, []);
 
+  const prefetchAllFolderFiles = useCallback(async () => {
+    try {
+      const entries = await Promise.all(
+        FOLDERS.map(async ({ key }) => {
+          const files = await getFiles(key);
+          const normalizedFiles = Array.isArray(files) ? files : [];
+          return [key, { files: normalizedFiles, ts: Date.now() }];
+        })
+      );
+      const nextCache = Object.fromEntries(entries);
+      folderFilesCacheRef.current = {
+        ...folderFilesCacheRef.current,
+        ...nextCache,
+      };
+      writeSessionCache(DASHBOARD_CACHE_KEYS.folderFilesByFolder, folderFilesCacheRef.current);
+      setFolderCounts((prev) => {
+        const next = { ...prev };
+        Object.entries(nextCache).forEach(([key, payload]) => {
+          next[key] = payload.files.length;
+        });
+        return next;
+      });
+      const selectedCached = folderFilesCacheRef.current[selectedFolderRef.current];
+      if (selectedCached && Array.isArray(selectedCached.files)) {
+        setFiles(selectedCached.files);
+        setLastUpdatedAt(new Date(selectedCached.ts).toISOString());
+      }
+    } catch {
+      // ignore prefetch errors; per-folder fetch path remains fallback
+    }
+  }, []);
+
   const refreshSelectedFolderFiles = useCallback(async (folderKey = selectedFolderRef.current, { force = false, background = false } = {}) => {
     const requestId = ++folderFetchRequestIdRef.current;
     setError("");
@@ -314,7 +350,9 @@ function Dashboard() {
     }
     const now = Date.now();
     const cached = folderFilesCacheRef.current[folderKey];
-    if (!force && cached && now - cached.ts < FOLDER_FILES_CACHE_TTL_MS) {
+    const hasCachedFiles = cached && Array.isArray(cached.files);
+    const isFreshCache = hasCachedFiles && now - cached.ts < FOLDER_FILES_CACHE_TTL_MS;
+    if (!force && hasCachedFiles) {
       setFiles(cached.files);
       setFolderCounts((prev) => ({
         ...prev,
@@ -322,8 +360,10 @@ function Dashboard() {
       }));
       setLastUpdatedAt(new Date(cached.ts).toISOString());
       setIsLoadingFiles(false);
-      // stale-while-revalidate: keep UI responsive with cache, refresh in background
-      refreshSelectedFolderFiles(folderKey, { force: true, background: true });
+      // stale-while-revalidate: render cache immediately and revalidate in background.
+      if (!isFreshCache) {
+        refreshSelectedFolderFiles(folderKey, { force: true, background: true });
+      }
       return;
     }
 
@@ -341,6 +381,7 @@ function Dashboard() {
         files: normalizedFiles,
         ts: Date.now(),
       };
+      writeSessionCache(DASHBOARD_CACHE_KEYS.folderFilesByFolder, folderFilesCacheRef.current);
       setFiles(normalizedFiles);
       setFolderCounts((prev) => ({
         ...prev,
@@ -361,11 +402,15 @@ function Dashboard() {
 
   const handleFolderSelect = useCallback(
     (folderKey) => {
+      const isSameFolder = selectedFolderRef.current === folderKey;
       selectedFolderRef.current = folderKey;
       setSelectedFolder(folderKey);
       setActivePage("folder");
+      if (isSameFolder) {
+        refreshSelectedFolderFiles(folderKey, { force: true });
+      }
     },
-    []
+    [refreshSelectedFolderFiles]
   );
 
   useEffect(() => {
@@ -382,8 +427,8 @@ function Dashboard() {
   }, [runFilesByRunId]);
 
   useEffect(() => {
-    refreshFolderCounts();
-  }, [refreshFolderCounts]);
+    prefetchAllFolderFiles();
+  }, [prefetchAllFolderFiles]);
 
   const refreshDashboard = useCallback(async ({ full = false } = {}) => {
     setIsLoadingDashboardFiles((dashboardFiles || []).length === 0);
