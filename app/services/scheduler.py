@@ -327,7 +327,7 @@ class Scheduler:
             result = self._register_and_trigger(file_path=file_path, source_id=None)
             if result:
                 rp = str(result.get("report_path") or "")
-                summary = self._read_accessibility_summary(rp) if rp else {"passed": 0, "failed": 0, "manual": 0}
+                summary = result.get("accessibility") or {"passed": 0, "failed": 0, "manual": 0}
                 files_summary.append(
                     {
                         "name": result.get("name", ""),
@@ -442,7 +442,7 @@ class Scheduler:
                 if result:
                     processed_count += 1
                     rp = str(result.get("report_path") or "")
-                    summary = self._read_accessibility_summary(rp) if rp else {"passed": 0, "failed": 0, "manual": 0}
+                    summary = result.get("accessibility") or {"passed": 0, "failed": 0, "manual": 0}
                     files_summary.append(
                         {
                             "name": result.get("name", ""),
@@ -556,13 +556,17 @@ class Scheduler:
                             "status": DocumentStatus.FAILED.value,
                             "error": "Failed to upload outputs to OneDrive.",
                             "report_path": result.get("report_path", ""),
+                            "accessibility": {"passed": 0, "failed": 0, "manual": 0},
                         }
+                report_path = str(result.get("report_path") or "")
+                summary = self._read_accessibility_summary(report_path) if report_path else {"passed": 0, "failed": 0, "manual": 0}
                 logger.info("Scheduler triggered processing: document_id=%s", document.id)
                 return {
                     "name": display_filename,
                     "status": DocumentStatus.COMPLETED.value,
                     "error": "",
-                    "report_path": result.get("report_path", ""),
+                    "report_path": report_path,
+                    "accessibility": summary,
                 }
             except IntegrityError:
                 await db.rollback()
@@ -583,6 +587,7 @@ class Scheduler:
                     "status": DocumentStatus.FAILED.value,
                     "error": str(exc) or "Pipeline failed.",
                     "report_path": "",
+                    "accessibility": {"passed": 0, "failed": 0, "manual": 0},
                 }
             except Exception:
                 logger.exception("Scheduler failed while handling file: filename=%s", display_filename)
@@ -591,6 +596,7 @@ class Scheduler:
                     "status": DocumentStatus.FAILED.value,
                     "error": "Scheduler failed while handling file.",
                     "report_path": "",
+                    "accessibility": {"passed": 0, "failed": 0, "manual": 0},
                 }
 
     async def _register_and_trigger_onedrive(
@@ -642,12 +648,15 @@ class Scheduler:
                     report_path=result["report_path"],
                     autotag_report_path=result.get("autotag_report_path"),
                 )
+                report_path = str(result.get("report_path") or "")
+                summary = self._read_accessibility_summary(report_path) if report_path else {"passed": 0, "failed": 0, "manual": 0}
                 logger.info("Processed OneDrive file successfully: source_id=%s document_id=%s", source_id, document.id)
                 return {
                     "name": original_filename,
                     "status": DocumentStatus.COMPLETED.value,
                     "error": "",
-                    "report_path": result.get("report_path", ""),
+                    "report_path": report_path,
+                    "accessibility": summary,
                 }
             except IntegrityError:
                 await db.rollback()
@@ -678,6 +687,7 @@ class Scheduler:
                     "status": DocumentStatus.FAILED.value,
                     "error": str(exc) or "Pipeline failed.",
                     "report_path": "",
+                    "accessibility": {"passed": 0, "failed": 0, "manual": 0},
                 }
             except OneDriveError:
                 if document:
@@ -690,6 +700,7 @@ class Scheduler:
                     "status": DocumentStatus.FAILED.value,
                     "error": "Upload failed for OneDrive outputs.",
                     "report_path": "",
+                    "accessibility": {"passed": 0, "failed": 0, "manual": 0},
                 }
 
     @staticmethod

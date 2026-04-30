@@ -14,6 +14,7 @@ export default function Sidebar({
   selectedFolder,
   setSelectedFolder,
   folderCounts,
+  onFolderSelect,
 }) {
   return (
     <aside className="w-72 bg-gray-900 text-white">
@@ -36,6 +37,10 @@ export default function Sidebar({
             key={folder.key}
             className={`sidebar-item ${activePage === "folder" && selectedFolder === folder.key ? "sidebar-active" : "text-gray-200"}`}
             onClick={() => {
+              if (typeof onFolderSelect === "function") {
+                onFolderSelect(folder.key);
+                return;
+              }
               setSelectedFolder(folder.key);
               setActivePage("folder");
             }}

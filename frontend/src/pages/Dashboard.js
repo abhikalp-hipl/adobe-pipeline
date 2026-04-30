@@ -277,6 +277,7 @@ function Dashboard() {
   const selectedFolderRef = useRef(selectedFolder);
   const lastTerminalRefreshAtRef = useRef(0);
   const runFilesByRunIdRef = useRef(runFilesByRunId);
+  const folderFetchRequestIdRef = useRef(0);
 
   const intervalOptions = [1, 2, 5, 10, 15, 30, 60];
   const isRunning = Boolean(pipelineStatus?.is_running);
@@ -301,7 +302,8 @@ function Dashboard() {
     }
   }, []);
 
-  const refreshSelectedFolderFiles = useCallback(async () => {
+  const refreshSelectedFolderFiles = useCallback(async (folderKey = selectedFolderRef.current) => {
+    const requestId = ++folderFetchRequestIdRef.current;
     setIsLoadingFiles(true);
     setError("");
     setFiles([]);
@@ -309,19 +311,37 @@ function Dashboard() {
     setFileContent(null);
     setXlsxContent(null);
     try {
-      const response = await getFiles(selectedFolderRef.current);
+      const response = await getFiles(folderKey);
+      if (requestId !== folderFetchRequestIdRef.current || folderKey !== selectedFolderRef.current) {
+        return;
+      }
       setFiles(response);
       setLastUpdatedAt(new Date().toISOString());
     } catch (requestError) {
+      if (requestId !== folderFetchRequestIdRef.current || folderKey !== selectedFolderRef.current) {
+        return;
+      }
       setError(requestError?.response?.data?.detail || "Failed to fetch files.");
     } finally {
-      setIsLoadingFiles(false);
+      if (requestId === folderFetchRequestIdRef.current && folderKey === selectedFolderRef.current) {
+        setIsLoadingFiles(false);
+      }
     }
   }, []);
 
+  const handleFolderSelect = useCallback(
+    (folderKey) => {
+      selectedFolderRef.current = folderKey;
+      setSelectedFolder(folderKey);
+      setActivePage("folder");
+      refreshSelectedFolderFiles(folderKey);
+    },
+    [refreshSelectedFolderFiles]
+  );
+
   useEffect(() => {
     selectedFolderRef.current = selectedFolder;
-    refreshSelectedFolderFiles();
+    refreshSelectedFolderFiles(selectedFolder);
   }, [selectedFolder, refreshSelectedFolderFiles]);
 
   useEffect(() => {
@@ -1060,6 +1080,7 @@ function Dashboard() {
         selectedFolder={selectedFolder}
         setSelectedFolder={setSelectedFolder}
         folderCounts={folderCounts}
+        onFolderSelect={handleFolderSelect}
       />
 
       <main className="flex-1 p-6 bg-gray-100 overflow-y-auto">
