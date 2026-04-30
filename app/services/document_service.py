@@ -5,6 +5,7 @@ from fastapi import HTTPException, UploadFile, status
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.db.models import Document, DocumentStatus
 
 INTAKE_DIR = Path("storage/intake")
@@ -15,6 +16,9 @@ class DocumentServiceError(Exception):
 
 
 def upload_document(file: UploadFile, db: Session) -> Document:
+    if settings.STORAGE_PROVIDER == "onedrive":
+        raise DocumentServiceError("Local upload storage is disabled in OneDrive-only mode.")
+
     if not file.filename:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

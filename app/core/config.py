@@ -40,3 +40,8 @@ class Settings:
 
 
 settings = Settings()
+
+if settings.STORAGE_PROVIDER != "onedrive":
+    raise ValueError(
+        "Invalid STORAGE_PROVIDER configuration. This deployment requires STORAGE_PROVIDER=onedrive."
+    )

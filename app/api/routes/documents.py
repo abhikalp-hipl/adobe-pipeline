@@ -27,6 +27,11 @@ def upload_document_endpoint(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
 ) -> DocumentResponse:
+    if settings.STORAGE_PROVIDER == "onedrive":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Local upload is disabled in OneDrive-only mode. Use OneDrive intake processing.",
+        )
     logger.info("Upload request received: filename=%s", file.filename)
     try:
         document = upload_document(file=file, db=db)
@@ -64,6 +69,11 @@ def process_document_endpoint(
     document_id: str,
     db: Session = Depends(get_db),
 ) -> dict[str, str]:
+    if settings.STORAGE_PROVIDER == "onedrive":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Manual local processing is disabled in OneDrive-only mode. Use /documents/onedrive/process-intake.",
+        )
     logger.info("Process request received: document_id=%s", document_id)
     orchestrator = Orchestrator(db=db)
     try:

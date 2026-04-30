@@ -2,7 +2,7 @@ import logging
 import threading
 import uuid
 import json
-import hashlib
+import tempfile
 from io import BytesIO
 from pathlib import Path
 from collections import Counter
@@ -44,7 +44,6 @@ from app.services.storage.onedrive import (
 logger = logging.getLogger(__name__)
 
 INTAKE_DIR = Path("storage/intake")
-PROCESSED_DIR = Path("storage/processed")
 IGNORED_SUFFIXES = {".tmp", ".part", ".swp"}
 ALLOWED_INPUT_EXTENSIONS = {".pdf", ".doc", ".docx"}
 DENIED_EXTENSIONS = {".xlsx", ".json", ".html"}
@@ -141,7 +140,6 @@ class Scheduler:
             logger.info("Scheduler already running")
             return
 
-        INTAKE_DIR.mkdir(parents=True, exist_ok=True)
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._run_loop, name="document-scheduler", daemon=True)
         self._eod_thread = threading.Thread(target=self._run_eod_loop, name="eod-scheduler", daemon=True)
@@ -194,12 +192,10 @@ class Scheduler:
                 access_failed = int(access.get("failed", 0))
                 access_manual = int(access.get("manual", 0))
             else:
-                run_result = self._poll_local_intake_folder()
-                files_summary = run_result.get("files", [])
-                access = run_result.get("accessibility", {})
-                access_passed = int(access.get("passed", 0))
-                access_failed = int(access.get("failed", 0))
-                access_manual = int(access.get("manual", 0))
+                raise RuntimeError(
+                    f"Unsupported storage provider '{self.storage_provider}'. "
+                    "This deployment requires STORAGE_PROVIDER=onedrive."
+                )
         except Exception:
             run_failed = True
             raise
@@ -418,24 +414,25 @@ class Scheduler:
         for index, remote_file in enumerate(process_batch):
             file_id = remote_file["id"]
             filename = Path(remote_file["name"]).name
-            local_path = INTAKE_DIR / f"{file_id}_{filename}"
             total_files = max(1, len(process_batch))
             self._mark_pipeline_progress(
                 filename=filename,
                 progress=int((index / total_files) * 100),
             )
             try:
-                self.onedrive_client.download_file(
-                    access_token=self._get_onedrive_access_token(),
-                    file_id=file_id,
-                    local_path=local_path,
-                )
-                logger.info("File fetched from OneDrive: file_id=%s filename=%s local_path=%s", file_id, filename, local_path)
-                result = self._register_and_trigger_onedrive(
-                    file_path=local_path,
-                    source_id=file_id,
-                    original_filename=filename,
-                )
+                with tempfile.TemporaryDirectory(prefix="onedrive-intake-") as temp_dir:
+                    local_path = Path(temp_dir) / f"{file_id}_{filename}"
+                    self.onedrive_client.download_file(
+                        access_token=self._get_onedrive_access_token(),
+                        file_id=file_id,
+                        local_path=local_path,
+                    )
+                    logger.info("File fetched from OneDrive: file_id=%s filename=%s local_path=%s", file_id, filename, local_path)
+                    result = self._register_and_trigger_onedrive(
+                        file_path=local_path,
+                        source_id=file_id,
+                        original_filename=filename,
+                    )
                 if result:
                     processed_count += 1
                     rp = str(result.get("report_path") or "")
@@ -477,12 +474,6 @@ class Scheduler:
                         "output_stem": "",
                     }
                 )
-            finally:
-                try:
-                    local_path.unlink(missing_ok=True)
-                except OSError:
-                    logger.warning("Failed to clean up downloaded OneDrive file: path=%s", local_path)
-
             if index < len(process_batch) - 1 and self.processing_delay_seconds > 0:
                 self._stop_event.wait(self.processing_delay_seconds)
 
@@ -506,14 +497,6 @@ class Scheduler:
         db = SessionLocal()
         try:
             dedupe_key = source_id or filename
-            if not source_id and self._is_duplicate_local_file(file_path):
-                logger.info("Scheduler skipping duplicate local file: filename=%s", display_filename)
-                return {
-                    "name": display_filename,
-                    "status": "SKIPPED",
-                    "error": "Already exists in processed archive.",
-                    "report_path": "",
-                }
             existing = db.query(Document).filter(Document.filename == dedupe_key).first()
             if existing:
                 if existing.status == DocumentStatus.FAILED:
@@ -1054,28 +1037,3 @@ class Scheduler:
             return False, "invalid"
         return True, "valid"
 
-    @staticmethod
-    def _sha256(path: Path) -> str:
-        digest = hashlib.sha256()
-        with path.open("rb") as handle:
-            while chunk := handle.read(1024 * 1024):
-                digest.update(chunk)
-        return digest.hexdigest()
-
-    def _is_duplicate_local_file(self, file_path: Path) -> bool:
-        candidate_name = file_path.name
-        existing_by_name = PROCESSED_DIR / candidate_name
-        if existing_by_name.exists():
-            return True
-        if not PROCESSED_DIR.exists():
-            return False
-        candidate_hash = self._sha256(file_path)
-        for processed_file in PROCESSED_DIR.iterdir():
-            if not processed_file.is_file():
-                continue
-            try:
-                if self._sha256(processed_file) == candidate_hash:
-                    return True
-            except OSError:
-                logger.warning("Unable to hash processed file for dedupe: path=%s", processed_file)
-        return False
