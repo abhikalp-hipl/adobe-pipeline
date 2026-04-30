@@ -321,11 +321,13 @@ class Scheduler:
             )
             result = self._register_and_trigger(file_path=file_path, source_id=None)
             if result:
+                rp = str(result.get("report_path") or "")
                 files_summary.append(
                     {
                         "name": result.get("name", ""),
                         "status": result.get("status", ""),
                         "error": result.get("error", ""),
+                        "output_stem": Scheduler._output_stem_from_report_path(rp),
                     }
                 )
                 report_path = result.get("report_path")
@@ -436,11 +438,13 @@ class Scheduler:
                 )
                 if result:
                     processed_count += 1
+                    rp = str(result.get("report_path") or "")
                     files_summary.append(
                         {
                             "name": result.get("name", ""),
                             "status": result.get("status", ""),
                             "error": result.get("error", ""),
+                            "output_stem": Scheduler._output_stem_from_report_path(rp),
                         }
                     )
                     report_path = result.get("report_path")
@@ -454,11 +458,25 @@ class Scheduler:
             except OneDriveNotFoundError:
                 failed_count += 1
                 logger.error("OneDrive file no longer exists: file_id=%s filename=%s", file_id, filename)
-                files_summary.append({"name": filename, "status": DocumentStatus.FAILED.value, "error": "OneDrive file no longer exists"})
+                files_summary.append(
+                    {
+                        "name": filename,
+                        "status": DocumentStatus.FAILED.value,
+                        "error": "OneDrive file no longer exists",
+                        "output_stem": "",
+                    }
+                )
             except OneDriveError:
                 failed_count += 1
                 logger.exception("Failed to download/process OneDrive file: file_id=%s filename=%s", file_id, filename)
-                files_summary.append({"name": filename, "status": DocumentStatus.FAILED.value, "error": "Failed to download/process OneDrive file"})
+                files_summary.append(
+                    {
+                        "name": filename,
+                        "status": DocumentStatus.FAILED.value,
+                        "error": "Failed to download/process OneDrive file",
+                        "output_stem": "",
+                    }
+                )
             finally:
                 try:
                     local_path.unlink(missing_ok=True)
@@ -702,6 +720,20 @@ class Scheduler:
         return f"{hours}h {minutes}m {sec}s"
 
     @staticmethod
+    def _output_stem_from_report_path(report_path: str) -> str:
+        """Stem used for *_accessibility_report.json / OneDrive uploads (may differ from display file_name)."""
+        if not report_path:
+            return ""
+        name = Path(report_path).name
+        lower = name.lower()
+        for suffix in ("_accessibility_report.json", "_report.json"):
+            if lower.endswith(suffix.lower()):
+                return name[: -len(suffix)]
+        if lower.endswith(".accessibility-report.json"):
+            return name[: -len(".accessibility-report.json")]
+        return ""
+
+    @staticmethod
     def _read_accessibility_summary(report_path: str) -> dict[str, int]:
         try:
             path = Path(report_path)
@@ -757,10 +789,12 @@ class Scheduler:
             for item in files_summary:
                 file_status = item.get("status")
                 status = PipelineRunStatus.COMPLETED if file_status == DocumentStatus.COMPLETED.value else PipelineRunStatus.FAILED
+                stem_val = str(item.get("output_stem") or "").strip() or None
                 db.add(
                     PipelineRunFile(
                         run_id=run_db_id,
                         file_name=str(item.get("name") or ""),
+                        output_stem=stem_val,
                         status=status,
                         error_message=str(item.get("error") or ""),
                     )

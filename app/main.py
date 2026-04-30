@@ -39,6 +39,7 @@ async def on_startup() -> None:
     Base.metadata.create_all(bind=engine)
     _ensure_user_token_columns()
     _ensure_notification_settings_columns()
+    _ensure_pipeline_run_file_columns()
     ws_manager = PipelineWebSocketManager()
     ws_manager.set_event_loop(asyncio.get_running_loop())
     app.state.pipeline_ws_manager = ws_manager
@@ -85,6 +86,16 @@ def _ensure_user_token_columns() -> None:
         if "tenant_id" not in existing_columns:
             connection.execute(text("ALTER TABLE user_tokens ADD COLUMN tenant_id VARCHAR(128)"))
             connection.execute(text("UPDATE user_tokens SET tenant_id = 'unknown-tenant' WHERE tenant_id IS NULL"))
+
+
+def _ensure_pipeline_run_file_columns() -> None:
+    with engine.begin() as connection:
+        rows = connection.execute(text("PRAGMA table_info(pipeline_run_files)")).fetchall()
+        if not rows:
+            return
+        existing_columns = {row[1] for row in rows}
+        if "output_stem" not in existing_columns:
+            connection.execute(text("ALTER TABLE pipeline_run_files ADD COLUMN output_stem VARCHAR(512)"))
 
 
 def _ensure_notification_settings_columns() -> None:

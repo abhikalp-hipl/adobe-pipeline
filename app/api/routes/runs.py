@@ -58,12 +58,10 @@ def list_run_files(run_id: str, db: Session = Depends(get_db)) -> list[PipelineR
     if not run:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found.")
     rows = db.query(PipelineRunFile).filter(PipelineRunFile.run_id == run.id).order_by(PipelineRunFile.created_at.asc()).all()
-    output_lookup, grouped_outputs = _build_output_catalog(db=db)
-    fallback_groups = list(grouped_outputs.values())
+    output_lookup, _grouped_outputs = _build_output_catalog(db=db)
     response: list[PipelineRunFileItem] = []
-    for idx, row in enumerate(rows):
-        fallback = fallback_groups[idx] if idx < len(fallback_groups) else None
-        response.append(_to_run_file_item(row, output_lookup=output_lookup, fallback_bundle=fallback))
+    for row in rows:
+        response.append(_to_run_file_item(row, output_lookup=output_lookup))
     return response
 
 
@@ -73,12 +71,10 @@ def get_run_details(run_id: str, db: Session = Depends(get_db)) -> PipelineRunDe
     if not run:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found.")
     rows = db.query(PipelineRunFile).filter(PipelineRunFile.run_id == run.id).order_by(PipelineRunFile.created_at.asc()).all()
-    output_lookup, grouped_outputs = _build_output_catalog(db=db)
-    fallback_groups = list(grouped_outputs.values())
+    output_lookup, _grouped_outputs = _build_output_catalog(db=db)
     files: list[PipelineRunFileItem] = []
-    for idx, row in enumerate(rows):
-        fallback = fallback_groups[idx] if idx < len(fallback_groups) else None
-        files.append(_to_run_file_item(row, output_lookup=output_lookup, fallback_bundle=fallback))
+    for row in rows:
+        files.append(_to_run_file_item(row, output_lookup=output_lookup))
     return PipelineRunDetailsResponse(
         run_id=run.run_id,
         start_time=run.start_time,
@@ -94,36 +90,29 @@ def get_run_details(run_id: str, db: Session = Depends(get_db)) -> PipelineRunDe
 def _to_run_file_item(
     row: PipelineRunFile,
     output_lookup: dict[str, str],
-    fallback_bundle: dict[str, str] | None = None,
 ) -> PipelineRunFileItem:
-    stem = _derive_output_stem(row.file_name)
+    persisted_stem = (getattr(row, "output_stem", None) or "").strip()
+    stem = persisted_stem or _derive_output_stem(row.file_name)
     pdf_id = _resolve_output_id(
         output_lookup,
         stem=stem,
         candidates=[f"{stem}_tagged_pdf.pdf", f"{stem}_tagged.pdf", f"{stem}.tagged.pdf"],
-        ext=".pdf",
     )
     json_id = _resolve_output_id(
         output_lookup,
         stem=stem,
         candidates=[f"{stem}_accessibility_report.json", f"{stem}_report.json", f"{stem}.accessibility-report.json"],
-        ext=".json",
     )
     xlsx_id = _resolve_output_id(
         output_lookup,
         stem=stem,
         candidates=[f"{stem}_tagged_report.xlsx", f"{stem}_report.xlsx", f"{stem}.autotag-report.xlsx"],
-        ext=".xlsx",
     )
     is_failed = row.status == PipelineRunStatus.FAILED
     if is_failed:
         pdf_id = ""
         json_id = ""
         xlsx_id = ""
-    elif fallback_bundle:
-        pdf_id = pdf_id or fallback_bundle.get("pdf", "")
-        json_id = json_id or fallback_bundle.get("json", "")
-        xlsx_id = xlsx_id or fallback_bundle.get("xlsx", "")
     outputs = {
         "pdf_url": f"/file-content?id={pdf_id}" if pdf_id else None,
         "json_url": f"/file-content?id={json_id}" if json_id else None,
@@ -191,21 +180,13 @@ def _build_output_catalog(db: Session) -> tuple[dict[str, str], dict[str, dict[s
         return {}, {}
 
 
-def _resolve_output_id(output_lookup: dict[str, str], stem: str, candidates: list[str], ext: str) -> str:
+def _resolve_output_id(output_lookup: dict[str, str], stem: str, candidates: list[str]) -> str:
     for name in candidates:
         file_id = output_lookup.get(name, "")
         if file_id:
             return file_id
-
-    # Fallback: tolerant matching for naming variants in output/success.
-    normalized_stem = stem.lower().replace(" ", "").replace("_", "").replace("-", "")
-    for name, file_id in output_lookup.items():
-        lower_name = name.lower()
-        if not lower_name.endswith(ext):
-            continue
-        normalized_name = lower_name.replace(" ", "").replace("_", "").replace("-", "")
-        if normalized_stem and normalized_stem in normalized_name:
-            return file_id
+    # Intentionally no substring fuzzy match: short stems (and substrings like "report")
+    # incorrectly resolve to the first OneDrive output and duplicate accessibility counts.
     return ""
 
 

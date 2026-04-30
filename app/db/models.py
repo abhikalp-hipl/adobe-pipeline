@@ -133,6 +133,8 @@ class PipelineRunFile(Base):
     )
     run_id: Mapped[str] = mapped_column(String(36), ForeignKey("pipeline_runs.id"), nullable=False, index=True)
     file_name: Mapped[str] = mapped_column(String(512), nullable=False)
+    # Prefix used for pipeline outputs (matches *_accessibility_report.json on disk / OneDrive).
+    output_stem: Mapped[str | None] = mapped_column(String(512), nullable=True)
     status: Mapped[PipelineRunStatus] = mapped_column(Enum(PipelineRunStatus), nullable=False)
     error_message: Mapped[str] = mapped_column(String, nullable=False, default="")
     created_at: Mapped[datetime] = mapped_column(
