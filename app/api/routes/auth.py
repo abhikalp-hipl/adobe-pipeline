@@ -2,13 +2,14 @@ import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import RedirectResponse
-from sqlalchemy.orm import Session
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.db.database import get_db
 from app.db.models import UserToken
 from app.services.auth.microsoft_auth import MicrosoftAuthError, MicrosoftAuthService
-from app.services.storage.onedrive import ensure_pipeline_folders_sync
+from app.services.storage.onedrive import ensure_pipeline_folders
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 logger = logging.getLogger(__name__)
@@ -31,13 +32,13 @@ def microsoft_login() -> RedirectResponse:
 
 
 @router.get("/callback")
-def microsoft_callback(
+async def microsoft_callback(
     request: Request,
     code: str = Query(default=""),
     state: str = Query(default=""),
     error: str = Query(default=""),
     error_description: str = Query(default=""),
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
 ) -> RedirectResponse:
     if error:
         raise HTTPException(
@@ -52,9 +53,9 @@ def microsoft_callback(
 
     auth_service = MicrosoftAuthService()
     try:
-        token_payload = auth_service.exchange_code_for_tokens(code=code)
-        auth_service.save_tokens(db=db, payload=token_payload)
-        ensure_pipeline_folders_sync(token_payload.access_token)
+        token_payload = await auth_service.exchange_code_for_tokens(code=code)
+        await auth_service.save_tokens(db=db, payload=token_payload)
+        await ensure_pipeline_folders(token_payload.access_token)
         logger.info(
             "Microsoft login success: tenant_id=%s user_email=%s",
             token_payload.tenant_id,
@@ -69,16 +70,18 @@ def microsoft_callback(
 
 
 @router.get("/status")
-def auth_status(db: Session = Depends(get_db)) -> dict[str, str | bool]:
-    token_row = db.query(UserToken).order_by(UserToken.updated_at.desc()).first()
+async def auth_status(db: AsyncSession = Depends(get_db)) -> dict[str, str | bool]:
+    token_row = (await db.execute(select(UserToken).order_by(UserToken.updated_at.desc()))).scalars().first()
     if not token_row:
         return {"authenticated": False, "user_email": ""}
     return {"authenticated": True, "user_email": token_row.user_email}
 
 
 @router.post("/logout")
-def auth_logout(db: Session = Depends(get_db)) -> dict[str, str]:
+async def auth_logout(db: AsyncSession = Depends(get_db)) -> dict[str, str]:
     # Single-user/dev setup: clear stored delegated token(s).
-    db.query(UserToken).delete()
-    db.commit()
+    token_rows = (await db.execute(select(UserToken))).scalars().all()
+    for token_row in token_rows:
+        await db.delete(token_row)
+    await db.commit()
     return {"detail": "Logged out"}

@@ -30,14 +30,14 @@ def _get_scheduler(request: Request) -> Scheduler:
 
 
 @router.post("/run-now", response_model=RunNowResponse)
-def run_now(request: Request) -> RunNowResponse:
+async def run_now(request: Request) -> RunNowResponse:
     scheduler = _get_scheduler(request=request)
-    scheduler.run_once()
+    await scheduler.run_once()
     return RunNowResponse(detail="Processing started")
 
 
 @router.get("/pipeline/status", response_model=PipelineStatusResponse)
-def get_pipeline_status(request: Request) -> PipelineStatusResponse:
+async def get_pipeline_status(request: Request) -> PipelineStatusResponse:
     scheduler = _get_scheduler(request=request)
     status_payload = scheduler.get_pipeline_status()
     return PipelineStatusResponse(
@@ -69,7 +69,7 @@ async def pipeline_status_ws(websocket: WebSocket) -> None:
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:
-        ws_manager.disconnect(websocket)
+        await ws_manager.disconnect(websocket)
     except Exception:
-        ws_manager.disconnect(websocket)
+        await ws_manager.disconnect(websocket)
 

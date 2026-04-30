@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import threading
 import uuid
@@ -9,7 +10,7 @@ from collections import Counter
 from typing import Callable
 
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy import func
+from sqlalchemy import func, select
 from openpyxl import Workbook
 
 from datetime import date, datetime, UTC
@@ -38,7 +39,7 @@ from app.services.storage.onedrive import (
     OneDriveClient,
     OneDriveError,
     OneDriveNotFoundError,
-    ensure_pipeline_folders_sync,
+    ensure_pipeline_folders,
 )
 
 logger = logging.getLogger(__name__)
@@ -47,7 +48,14 @@ INTAKE_DIR = Path("storage/intake")
 IGNORED_SUFFIXES = {".tmp", ".part", ".swp"}
 ALLOWED_INPUT_EXTENSIONS = {".pdf", ".doc", ".docx"}
 DENIED_EXTENSIONS = {".xlsx", ".json", ".html"}
-GENERATED_MARKERS = (".converted", ".tagged", "report")
+GENERATED_ARTIFACT_SUFFIXES = (
+    ".converted.pdf",
+    ".tagged.pdf",
+    "_tagged_pdf.pdf",
+    "_accessibility_report.json",
+    "_tagged_report.xlsx",
+    ".autotag-report.xlsx",
+)
 
 
 class Scheduler:
@@ -67,6 +75,7 @@ class Scheduler:
         self.last_failure: dict | None = None
         self._status_listener = status_listener
         self._status_lock = threading.Lock()
+        self._onedrive_folders_ensured = False
         self.pipeline_status: dict[str, object] = {
             "is_running": False,
             "current_step": None,
@@ -170,14 +179,14 @@ class Scheduler:
         # Wake the scheduler loop so the new interval takes effect immediately.
         self._wakeup_event.set()
 
-    def run_once(self) -> None:
+    async def run_once(self) -> None:
         self._mark_pipeline_started()
         run_id = str(uuid.uuid4())
         started_at = datetime.now(UTC)
         logger.info("Manual scheduler run started: run_id=%s", run_id)
-        run_db_id = self._create_pipeline_run(run_id=run_id, start_time=started_at)
+        run_db_id = await self._create_pipeline_run(run_id=run_id, start_time=started_at)
 
-        files_summary: list[dict[str, str]] = []
+        files_summary: list[dict[str, object]] = []
         access_passed = 0
         access_failed = 0
         access_manual = 0
@@ -185,7 +194,7 @@ class Scheduler:
 
         try:
             if self.storage_provider == "onedrive":
-                run_result = self.process_onedrive_intake()
+                run_result = await self.process_onedrive_intake()
                 files_summary = run_result.get("files", [])
                 access = run_result.get("accessibility", {})
                 access_passed = int(access.get("passed", 0))
@@ -208,8 +217,8 @@ class Scheduler:
             final_status = PipelineRunStatus.FAILED if run_failed else PipelineRunStatus.COMPLETED
 
             if run_db_id:
-                self._store_pipeline_run_files(run_db_id=run_db_id, files_summary=files_summary)
-                self._finalize_pipeline_run(
+                await self._store_pipeline_run_files(run_db_id=run_db_id, files_summary=files_summary)
+                await self._finalize_pipeline_run(
                     run_db_id=run_db_id,
                     end_time=finished_at,
                     duration=duration,
@@ -233,7 +242,7 @@ class Scheduler:
             }
 
             try:
-                recipient_emails = self._get_notification_emails()
+                recipient_emails = await self._get_notification_emails()
                 if not recipient_emails:
                     logger.info("Skipping email notification (no configured recipients): run_id=%s", run_id)
                 else:
@@ -243,7 +252,7 @@ class Scheduler:
                         subject = f"❌ Pipeline Completed with Errors | {failure_count} Failed"
                     html_content = build_pipeline_email(run_data)
                     for recipient in recipient_emails:
-                        send_email(to_email=recipient, subject=subject, html_content=html_content)
+                        await send_email(to_email=recipient, subject=subject, html_content=html_content)
                     logger.info(
                         "Pipeline summary email sent: run_id=%s recipients=%s",
                         run_id,
@@ -269,7 +278,7 @@ class Scheduler:
                 continue
             logger.info("Scheduler polling cycle started")
             try:
-                self.run_once()
+                asyncio.run(self.run_once())
             except Exception:
                 logger.exception("Scheduler polling cycle failed")
             logger.info("Scheduler polling cycle ended")
@@ -304,7 +313,7 @@ class Scheduler:
             self.max_files_per_cycle,
         )
 
-        files_summary: list[dict[str, str]] = []
+        files_summary: list[dict[str, object]] = []
         access_passed = 0
         access_failed = 0
         access_manual = 0
@@ -318,20 +327,19 @@ class Scheduler:
             result = self._register_and_trigger(file_path=file_path, source_id=None)
             if result:
                 rp = str(result.get("report_path") or "")
+                summary = self._read_accessibility_summary(rp) if rp else {"passed": 0, "failed": 0, "manual": 0}
                 files_summary.append(
                     {
                         "name": result.get("name", ""),
                         "status": result.get("status", ""),
                         "error": result.get("error", ""),
                         "output_stem": Scheduler._output_stem_from_report_path(rp),
+                        "accessibility": summary,
                     }
                 )
-                report_path = result.get("report_path")
-                if report_path:
-                    summary = self._read_accessibility_summary(report_path)
-                    access_passed += int(summary.get("passed", 0))
-                    access_failed += int(summary.get("failed", 0))
-                    access_manual += int(summary.get("manual", 0))
+                access_passed += int(summary.get("passed", 0))
+                access_failed += int(summary.get("failed", 0))
+                access_manual += int(summary.get("manual", 0))
             if index < len(process_batch) - 1 and self.processing_delay_seconds > 0:
                 self._stop_event.wait(self.processing_delay_seconds)
 
@@ -340,20 +348,22 @@ class Scheduler:
             "accessibility": {"passed": access_passed, "failed": access_failed, "manual": access_manual},
         }
 
-    def process_onedrive_intake(self) -> dict:
+    async def process_onedrive_intake(self) -> dict:
         if not self.onedrive_client:
             raise OneDriveError("OneDrive client is not initialized.")
         if not self.auth_service:
             raise MicrosoftAuthError("Microsoft auth service is not initialized.")
 
-        try:
-            ensure_pipeline_folders_sync(self._get_onedrive_access_token())
-        except Exception:
-            logger.exception("Failed to ensure required OneDrive pipeline folders before intake processing.")
+        if not self._onedrive_folders_ensured:
+            try:
+                await ensure_pipeline_folders(await self._get_onedrive_access_token())
+                self._onedrive_folders_ensured = True
+            except Exception:
+                logger.exception("Failed to ensure required OneDrive pipeline folders before intake processing.")
 
         try:
-            all_files = self.onedrive_client.list_files(
-                access_token=self._get_onedrive_access_token(),
+            all_files = await self.onedrive_client.list_files(
+                access_token=await self._get_onedrive_access_token(),
                 folder_path=INTAKE_FOLDER,
             )
         except (OneDriveError, MicrosoftAuthError):
@@ -374,19 +384,15 @@ class Scheduler:
 
         # Apply max_files_per_cycle to files that are not already known in DB,
         # so previously processed files do not consume the current run capacity.
-        db = SessionLocal()
-        try:
+        async with SessionLocal() as db:
             candidate_source_ids = [item["id"] for item in candidate_files]
             existing_source_ids: set[str] = set()
             if candidate_source_ids:
                 existing_rows = (
-                    db.query(Document.filename)
-                    .filter(Document.filename.in_(candidate_source_ids))
-                    .all()
+                    await db.execute(select(Document.filename).where(Document.filename.in_(candidate_source_ids)))
                 )
+                existing_rows = existing_rows.all()
                 existing_source_ids = {row[0] for row in existing_rows}
-        finally:
-            db.close()
 
         process_batch = []
         for remote_file in candidate_files:
@@ -407,7 +413,7 @@ class Scheduler:
         processed_count = 0
         skipped_count = len(candidate_files) - len(process_batch)
         failed_count = 0
-        files_summary: list[dict[str, str]] = []
+        files_summary: list[dict[str, object]] = []
         access_passed = 0
         access_failed = 0
         access_manual = 0
@@ -422,13 +428,13 @@ class Scheduler:
             try:
                 with tempfile.TemporaryDirectory(prefix="onedrive-intake-") as temp_dir:
                     local_path = Path(temp_dir) / f"{file_id}_{filename}"
-                    self.onedrive_client.download_file(
-                        access_token=self._get_onedrive_access_token(),
+                    await self.onedrive_client.download_file(
+                        access_token=await self._get_onedrive_access_token(),
                         file_id=file_id,
                         local_path=local_path,
                     )
                     logger.info("File fetched from OneDrive: file_id=%s filename=%s local_path=%s", file_id, filename, local_path)
-                    result = self._register_and_trigger_onedrive(
+                    result = await self._register_and_trigger_onedrive(
                         file_path=local_path,
                         source_id=file_id,
                         original_filename=filename,
@@ -436,20 +442,19 @@ class Scheduler:
                 if result:
                     processed_count += 1
                     rp = str(result.get("report_path") or "")
+                    summary = self._read_accessibility_summary(rp) if rp else {"passed": 0, "failed": 0, "manual": 0}
                     files_summary.append(
                         {
                             "name": result.get("name", ""),
                             "status": result.get("status", ""),
                             "error": result.get("error", ""),
                             "output_stem": Scheduler._output_stem_from_report_path(rp),
+                            "accessibility": summary,
                         }
                     )
-                    report_path = result.get("report_path")
-                    if report_path:
-                        summary = self._read_accessibility_summary(report_path)
-                        access_passed += int(summary.get("passed", 0))
-                        access_failed += int(summary.get("failed", 0))
-                        access_manual += int(summary.get("manual", 0))
+                    access_passed += int(summary.get("passed", 0))
+                    access_failed += int(summary.get("failed", 0))
+                    access_manual += int(summary.get("manual", 0))
                 else:
                     skipped_count += 1
             except OneDriveNotFoundError:
@@ -485,7 +490,7 @@ class Scheduler:
             "accessibility": {"passed": access_passed, "failed": access_failed, "manual": access_manual},
         }
 
-    def _register_and_trigger(
+    async def _register_and_trigger(
         self,
         file_path: Path,
         source_id: str | None,
@@ -494,202 +499,198 @@ class Scheduler:
         display_filename = original_filename or file_path.name
         filename = file_path.name
         logger.info("Scheduler evaluating file: filename=%s source_id=%s", display_filename, source_id or "n/a")
-        db = SessionLocal()
-        try:
-            dedupe_key = source_id or filename
-            existing = db.query(Document).filter(Document.filename == dedupe_key).first()
-            if existing:
-                if existing.status == DocumentStatus.FAILED:
-                    logger.info(
-                        "Scheduler skipping recently failed file: filename=%s source_id=%s document_id=%s",
-                        display_filename,
-                        source_id or "n/a",
-                        existing.id,
-                    )
-                else:
-                    logger.info(
-                        "Scheduler skipping known file: filename=%s source_id=%s document_id=%s",
-                        display_filename,
-                        source_id or "n/a",
-                        existing.id,
-                    )
+        async with SessionLocal() as db:
+            try:
+                dedupe_key = source_id or filename
+                existing = (await db.execute(select(Document).where(Document.filename == dedupe_key))).scalars().first()
+                if existing:
+                    if existing.status == DocumentStatus.FAILED:
+                        logger.info(
+                            "Scheduler skipping recently failed file: filename=%s source_id=%s document_id=%s",
+                            display_filename,
+                            source_id or "n/a",
+                            existing.id,
+                        )
+                    else:
+                        logger.info(
+                            "Scheduler skipping known file: filename=%s source_id=%s document_id=%s",
+                            display_filename,
+                            source_id or "n/a",
+                            existing.id,
+                        )
+                    return {
+                        "name": display_filename,
+                        "status": existing.status.value,
+                        "error": "Already processed.",
+                        "report_path": "",
+                    }
+
+                document = Document(filename=dedupe_key, status=DocumentStatus.UPLOADED)
+                db.add(document)
+                await db.commit()
+                await db.refresh(document)
+                logger.info(
+                    "Scheduler created document: document_id=%s dedupe_key=%s source_file=%s",
+                    document.id,
+                    dedupe_key,
+                    display_filename,
+                )
+
+                orchestrator = Orchestrator(db=db)
+                result = await orchestrator.process_document(document_id=document.id, input_path=file_path)
+
+                if self.storage_provider == "onedrive":
+                    try:
+                        await self._upload_onedrive_outputs(
+                            tagged_pdf_path=result["tagged_pdf_path"],
+                            report_path=result["report_path"],
+                            autotag_report_path=result.get("autotag_report_path"),
+                        )
+                    except OneDriveError:
+                        document.status = DocumentStatus.FAILED
+                        db.add(document)
+                        await db.commit()
+                        logger.exception("Scheduler failed to upload outputs to OneDrive: document_id=%s", document.id)
+                        return {
+                            "name": display_filename,
+                            "status": DocumentStatus.FAILED.value,
+                            "error": "Failed to upload outputs to OneDrive.",
+                            "report_path": result.get("report_path", ""),
+                        }
+                logger.info("Scheduler triggered processing: document_id=%s", document.id)
                 return {
                     "name": display_filename,
-                    "status": existing.status.value,
-                    "error": "Already processed.",
+                    "status": DocumentStatus.COMPLETED.value,
+                    "error": "",
+                    "report_path": result.get("report_path", ""),
+                }
+            except IntegrityError:
+                await db.rollback()
+                logger.info("Scheduler encountered duplicate file insert: filename=%s", display_filename)
+                return {"name": display_filename, "status": "SKIPPED", "error": "Duplicate insert ignored.", "report_path": ""}
+            except OrchestratorError as exc:
+                logger.exception("Scheduler processing failed for file: filename=%s", display_filename)
+                failed_step = getattr(exc, "failed_step", "") or "unknown"
+                progress_map = {"fetch": 5, "convert_to_pdf": 30, "auto_tag": 60, "check_accessibility": 80}
+                self._record_failure(
+                    filename=display_filename,
+                    failed_step=failed_step,
+                    error=str(exc) or "Pipeline failed.",
+                    progress=int(progress_map.get(failed_step, 40)),
+                )
+                return {
+                    "name": display_filename,
+                    "status": DocumentStatus.FAILED.value,
+                    "error": str(exc) or "Pipeline failed.",
+                    "report_path": "",
+                }
+            except Exception:
+                logger.exception("Scheduler failed while handling file: filename=%s", display_filename)
+                return {
+                    "name": display_filename,
+                    "status": DocumentStatus.FAILED.value,
+                    "error": "Scheduler failed while handling file.",
                     "report_path": "",
                 }
 
-            document = Document(filename=dedupe_key, status=DocumentStatus.UPLOADED)
-            db.add(document)
-            db.commit()
-            db.refresh(document)
-            logger.info(
-                "Scheduler created document: document_id=%s dedupe_key=%s source_file=%s",
-                document.id,
-                dedupe_key,
-                display_filename,
-            )
-
-            orchestrator = Orchestrator(db=db)
-            result = orchestrator.process_document(document_id=document.id, input_path=file_path)
-
-            if self.storage_provider == "onedrive":
-                try:
-                    self._upload_onedrive_outputs(
-                        tagged_pdf_path=result["tagged_pdf_path"],
-                        report_path=result["report_path"],
-                        autotag_report_path=result.get("autotag_report_path"),
-                    )
-                except OneDriveError:
-                    document.status = DocumentStatus.FAILED
-                    db.add(document)
-                    db.commit()
-                    logger.exception("Scheduler failed to upload outputs to OneDrive: document_id=%s", document.id)
-                    return {
-                        "name": display_filename,
-                        "status": DocumentStatus.FAILED.value,
-                        "error": "Failed to upload outputs to OneDrive.",
-                        "report_path": result.get("report_path", ""),
-                    }
-            logger.info("Scheduler triggered processing: document_id=%s", document.id)
-            return {
-                "name": display_filename,
-                "status": DocumentStatus.COMPLETED.value,
-                "error": "",
-                "report_path": result.get("report_path", ""),
-            }
-        except IntegrityError:
-            db.rollback()
-            logger.info("Scheduler encountered duplicate file insert: filename=%s", display_filename)
-            return {"name": display_filename, "status": "SKIPPED", "error": "Duplicate insert ignored.", "report_path": ""}
-        except OrchestratorError as exc:
-            logger.exception("Scheduler processing failed for file: filename=%s", display_filename)
-            failed_step = getattr(exc, "failed_step", "") or "unknown"
-            progress_map = {"fetch": 5, "convert_to_pdf": 30, "auto_tag": 60, "check_accessibility": 80}
-            self._record_failure(
-                filename=display_filename,
-                failed_step=failed_step,
-                error=str(exc) or "Pipeline failed.",
-                progress=int(progress_map.get(failed_step, 40)),
-            )
-            return {
-                "name": display_filename,
-                "status": DocumentStatus.FAILED.value,
-                "error": str(exc) or "Pipeline failed.",
-                "report_path": "",
-            }
-        except Exception:
-            logger.exception("Scheduler failed while handling file: filename=%s", display_filename)
-            return {
-                "name": display_filename,
-                "status": DocumentStatus.FAILED.value,
-                "error": "Scheduler failed while handling file.",
-                "report_path": "",
-            }
-        finally:
-            db.close()
-
-    def _register_and_trigger_onedrive(
+    async def _register_and_trigger_onedrive(
         self,
         file_path: Path,
         source_id: str,
         original_filename: str,
     ) -> dict[str, str] | None:
-        db = SessionLocal()
         document: Document | None = None
-        try:
-            existing = db.query(Document).filter(Document.filename == source_id).first()
-            if existing:
+        async with SessionLocal() as db:
+            try:
+                existing = (await db.execute(select(Document).where(Document.filename == source_id))).scalars().first()
+                if existing:
+                    logger.info(
+                        "Skipping already processed OneDrive file: source_id=%s filename=%s document_id=%s",
+                        source_id,
+                        original_filename,
+                        existing.id,
+                    )
+                    return {
+                        "name": original_filename,
+                        "status": existing.status.value,
+                        "error": "Already processed.",
+                        "report_path": "",
+                    }
+
+                document = Document(filename=source_id, status=DocumentStatus.UPLOADED)
+                db.add(document)
+                await db.commit()
+                await db.refresh(document)
                 logger.info(
-                    "Skipping already processed OneDrive file: source_id=%s filename=%s document_id=%s",
+                    "Created document for OneDrive file: document_id=%s source_id=%s filename=%s",
+                    document.id,
                     source_id,
                     original_filename,
-                    existing.id,
+                )
+
+                orchestrator = Orchestrator(db=db)
+                result = await orchestrator.process_document(document_id=document.id, input_path=file_path)
+                await self.onedrive_client.move_file(
+                    access_token=await self._get_onedrive_access_token(),
+                    file_id=source_id,
+                    folder_path=PROCESSED_FOLDER,
+                    filename=original_filename,
+                )
+                logger.info("OneDrive original moved to processed: file_id=%s filename=%s", source_id, original_filename)
+                await self._upload_onedrive_outputs(
+                    tagged_pdf_path=result["tagged_pdf_path"],
+                    report_path=result["report_path"],
+                    autotag_report_path=result.get("autotag_report_path"),
+                )
+                logger.info("Processed OneDrive file successfully: source_id=%s document_id=%s", source_id, document.id)
+                return {
+                    "name": original_filename,
+                    "status": DocumentStatus.COMPLETED.value,
+                    "error": "",
+                    "report_path": result.get("report_path", ""),
+                }
+            except IntegrityError:
+                await db.rollback()
+                logger.info("Duplicate OneDrive document insert ignored: source_id=%s", source_id)
+                return {"name": original_filename, "status": "SKIPPED", "error": "Duplicate insert ignored.", "report_path": ""}
+            except OrchestratorError as exc:
+                logger.exception("Processing failed for OneDrive file: source_id=%s filename=%s", source_id, original_filename)
+                try:
+                    await self.onedrive_client.move_file(
+                        access_token=await self._get_onedrive_access_token(),
+                        file_id=source_id,
+                        folder_path=OUTPUT_FAILURE_FOLDER,
+                        filename=original_filename,
+                    )
+                    logger.info("OneDrive original moved to failure: file_id=%s filename=%s", source_id, original_filename)
+                except OneDriveError:
+                    logger.exception("Failed to move OneDrive original to failure: file_id=%s", source_id)
+                failed_step = getattr(exc, "failed_step", "") or "unknown"
+                progress_map = {"fetch": 5, "convert_to_pdf": 30, "auto_tag": 60, "check_accessibility": 80}
+                self._record_failure(
+                    filename=original_filename,
+                    failed_step=failed_step,
+                    error=str(exc) or "Pipeline failed.",
+                    progress=int(progress_map.get(failed_step, 40)),
                 )
                 return {
                     "name": original_filename,
-                    "status": existing.status.value,
-                    "error": "Already processed.",
+                    "status": DocumentStatus.FAILED.value,
+                    "error": str(exc) or "Pipeline failed.",
                     "report_path": "",
                 }
-
-            document = Document(filename=source_id, status=DocumentStatus.UPLOADED)
-            db.add(document)
-            db.commit()
-            db.refresh(document)
-            logger.info(
-                "Created document for OneDrive file: document_id=%s source_id=%s filename=%s",
-                document.id,
-                source_id,
-                original_filename,
-            )
-
-            orchestrator = Orchestrator(db=db)
-            result = orchestrator.process_document(document_id=document.id, input_path=file_path)
-            self.onedrive_client.move_file(
-                access_token=self._get_onedrive_access_token(),
-                file_id=source_id,
-                folder_path=PROCESSED_FOLDER,
-                filename=original_filename,
-            )
-            logger.info("OneDrive original moved to processed: file_id=%s filename=%s", source_id, original_filename)
-            self._upload_onedrive_outputs(
-                tagged_pdf_path=result["tagged_pdf_path"],
-                report_path=result["report_path"],
-                autotag_report_path=result.get("autotag_report_path"),
-            )
-            logger.info("Processed OneDrive file successfully: source_id=%s document_id=%s", source_id, document.id)
-            return {
-                "name": original_filename,
-                "status": DocumentStatus.COMPLETED.value,
-                "error": "",
-                "report_path": result.get("report_path", ""),
-            }
-        except IntegrityError:
-            db.rollback()
-            logger.info("Duplicate OneDrive document insert ignored: source_id=%s", source_id)
-            return {"name": original_filename, "status": "SKIPPED", "error": "Duplicate insert ignored.", "report_path": ""}
-        except OrchestratorError as exc:
-            logger.exception("Processing failed for OneDrive file: source_id=%s filename=%s", source_id, original_filename)
-            try:
-                self.onedrive_client.move_file(
-                    access_token=self._get_onedrive_access_token(),
-                    file_id=source_id,
-                    folder_path=OUTPUT_FAILURE_FOLDER,
-                    filename=original_filename,
-                )
-                logger.info("OneDrive original moved to failure: file_id=%s filename=%s", source_id, original_filename)
             except OneDriveError:
-                logger.exception("Failed to move OneDrive original to failure: file_id=%s", source_id)
-            failed_step = getattr(exc, "failed_step", "") or "unknown"
-            progress_map = {"fetch": 5, "convert_to_pdf": 30, "auto_tag": 60, "check_accessibility": 80}
-            self._record_failure(
-                filename=original_filename,
-                failed_step=failed_step,
-                error=str(exc) or "Pipeline failed.",
-                progress=int(progress_map.get(failed_step, 40)),
-            )
-            return {
-                "name": original_filename,
-                "status": DocumentStatus.FAILED.value,
-                "error": str(exc) or "Pipeline failed.",
-                "report_path": "",
-            }
-        except OneDriveError:
-            if document:
-                document.status = DocumentStatus.FAILED
-                db.add(document)
-                db.commit()
-            logger.exception("Upload failed for OneDrive outputs: source_id=%s document_id=%s", source_id, document.id if document else "n/a")
-            return {
-                "name": original_filename,
-                "status": DocumentStatus.FAILED.value,
-                "error": "Upload failed for OneDrive outputs.",
-                "report_path": "",
-            }
-        finally:
-            db.close()
+                if document:
+                    document.status = DocumentStatus.FAILED
+                    db.add(document)
+                    await db.commit()
+                logger.exception("Upload failed for OneDrive outputs: source_id=%s document_id=%s", source_id, document.id if document else "n/a")
+                return {
+                    "name": original_filename,
+                    "status": DocumentStatus.FAILED.value,
+                    "error": "Upload failed for OneDrive outputs.",
+                    "report_path": "",
+                }
 
     @staticmethod
     def _format_duration(delta: timedelta) -> str:
@@ -734,63 +735,61 @@ class Scheduler:
             return {"passed": 0, "failed": 0, "manual": 0}
 
     @staticmethod
-    def _get_notification_emails() -> list[str]:
-        db = SessionLocal()
-        try:
-            rows = db.query(EmailGroup.email).order_by(EmailGroup.created_at.asc()).all()
-            emails = [row[0].strip().lower() for row in rows if row and row[0]]
-            deduped = list(dict.fromkeys(emails))
-            return deduped
-        except Exception:
-            logger.exception("Failed to resolve notification email list")
-            return []
-        finally:
-            db.close()
+    async def _get_notification_emails() -> list[str]:
+        async with SessionLocal() as db:
+            try:
+                rows = (await db.execute(select(EmailGroup.email).order_by(EmailGroup.created_at.asc()))).all()
+                emails = [row[0].strip().lower() for row in rows if row and row[0]]
+                deduped = list(dict.fromkeys(emails))
+                return deduped
+            except Exception:
+                logger.exception("Failed to resolve notification email list")
+                return []
 
     @staticmethod
-    def _create_pipeline_run(run_id: str, start_time: datetime) -> str:
-        db = SessionLocal()
-        try:
-            row = PipelineRun(run_id=run_id, start_time=start_time, status=PipelineRunStatus.COMPLETED)
-            db.add(row)
-            db.commit()
-            db.refresh(row)
-            return row.id
-        except Exception:
-            db.rollback()
-            logger.exception("Failed to create pipeline run row: run_id=%s", run_id)
-            return ""
-        finally:
-            db.close()
+    async def _create_pipeline_run(run_id: str, start_time: datetime) -> str:
+        async with SessionLocal() as db:
+            try:
+                row = PipelineRun(run_id=run_id, start_time=start_time, status=PipelineRunStatus.COMPLETED)
+                db.add(row)
+                await db.commit()
+                await db.refresh(row)
+                return row.id
+            except Exception:
+                await db.rollback()
+                logger.exception("Failed to create pipeline run row: run_id=%s", run_id)
+                return ""
 
     @staticmethod
-    def _store_pipeline_run_files(run_db_id: str, files_summary: list[dict[str, str]]) -> None:
+    async def _store_pipeline_run_files(run_db_id: str, files_summary: list[dict[str, object]]) -> None:
         if not run_db_id or not files_summary:
             return
-        db = SessionLocal()
-        try:
-            for item in files_summary:
-                file_status = item.get("status")
-                status = PipelineRunStatus.COMPLETED if file_status == DocumentStatus.COMPLETED.value else PipelineRunStatus.FAILED
-                stem_val = str(item.get("output_stem") or "").strip() or None
-                db.add(
-                    PipelineRunFile(
-                        run_id=run_db_id,
-                        file_name=str(item.get("name") or ""),
-                        output_stem=stem_val,
-                        status=status,
-                        error_message=str(item.get("error") or ""),
+        async with SessionLocal() as db:
+            try:
+                for item in files_summary:
+                    file_status = item.get("status")
+                    status = PipelineRunStatus.COMPLETED if file_status == DocumentStatus.COMPLETED.value else PipelineRunStatus.FAILED
+                    stem_val = str(item.get("output_stem") or "").strip() or None
+                    accessibility = item.get("accessibility") or {}
+                    db.add(
+                        PipelineRunFile(
+                            run_id=run_db_id,
+                            file_name=str(item.get("name") or ""),
+                            output_stem=stem_val,
+                            status=status,
+                            error_message=str(item.get("error") or ""),
+                            accessibility_passed=int(accessibility.get("passed", 0)),
+                            accessibility_failed=int(accessibility.get("failed", 0)),
+                            accessibility_manual=int(accessibility.get("manual", 0)),
+                        )
                     )
-                )
-            db.commit()
-        except Exception:
-            db.rollback()
-            logger.exception("Failed to store pipeline run file rows: run_db_id=%s", run_db_id)
-        finally:
-            db.close()
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                logger.exception("Failed to store pipeline run file rows: run_db_id=%s", run_db_id)
 
     @staticmethod
-    def _finalize_pipeline_run(
+    async def _finalize_pipeline_run(
         run_db_id: str,
         end_time: datetime,
         duration: str,
@@ -801,140 +800,142 @@ class Scheduler:
     ) -> None:
         if not run_db_id:
             return
-        db = SessionLocal()
-        try:
-            row = db.query(PipelineRun).filter(PipelineRun.id == run_db_id).first()
-            if not row:
-                return
-            row.end_time = end_time
-            row.duration = duration
-            row.total_files = int(total_files)
-            row.success_count = int(success_count)
-            row.failure_count = int(failure_count)
-            row.status = status
-            db.add(row)
-            db.commit()
-        except Exception:
-            db.rollback()
-            logger.exception("Failed to finalize pipeline run row: run_db_id=%s", run_db_id)
-        finally:
-            db.close()
+        async with SessionLocal() as db:
+            try:
+                row = (await db.execute(select(PipelineRun).where(PipelineRun.id == run_db_id))).scalars().first()
+                if not row:
+                    return
+                row.end_time = end_time
+                row.duration = duration
+                row.total_files = int(total_files)
+                row.success_count = int(success_count)
+                row.failure_count = int(failure_count)
+                row.status = status
+                db.add(row)
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                logger.exception("Failed to finalize pipeline run row: run_db_id=%s", run_db_id)
 
     def _maybe_send_eod_summary(self) -> None:
-        db = SessionLocal()
-        try:
-            settings_row = db.query(NotificationSettings).order_by(NotificationSettings.created_at.asc()).first()
-            if not settings_row:
-                settings_row = NotificationSettings(eod_time="18:00", enabled=False)
-                db.add(settings_row)
-                db.commit()
-                db.refresh(settings_row)
+        asyncio.run(self._maybe_send_eod_summary_async())
 
-            if not settings_row.enabled:
-                return
+    async def _maybe_send_eod_summary_async(self) -> None:
+        async with SessionLocal() as db:
+            try:
+                settings_row = (
+                    await db.execute(select(NotificationSettings).order_by(NotificationSettings.created_at.asc()))
+                ).scalars().first()
+                if not settings_row:
+                    settings_row = NotificationSettings(eod_time="18:00", enabled=False)
+                    db.add(settings_row)
+                    await db.commit()
+                    await db.refresh(settings_row)
 
-            now = datetime.now()
-            current_hhmm = now.strftime("%H:%M")
-            if current_hhmm != settings_row.eod_time:
-                return
+                if not settings_row.enabled:
+                    return
 
-            today = now.date()
-            if settings_row.last_sent_date == today:
-                return
+                now = datetime.now()
+                current_hhmm = now.strftime("%H:%M")
+                if current_hhmm != settings_row.eod_time:
+                    return
 
-            day_start = datetime.combine(today, datetime.min.time())
-            day_end = day_start + timedelta(days=1)
-            runs = (
-                db.query(PipelineRun)
-                .filter(PipelineRun.created_at >= day_start, PipelineRun.created_at < day_end)
-                .order_by(PipelineRun.start_time.asc())
-                .all()
-            )
-            total_runs = len(runs)
-            total_files = sum(int(item.total_files or 0) for item in runs)
-            total_success = sum(int(item.success_count or 0) for item in runs)
-            total_failure = sum(int(item.failure_count or 0) for item in runs)
+                today = now.date()
+                if settings_row.last_sent_date == today:
+                    return
 
-            run_rows = [
-                {
-                    "run_id": item.run_id,
-                    "start_time": item.start_time,
-                    "total_files": item.total_files,
-                    "success_count": item.success_count,
-                    "failure_count": item.failure_count,
-                    "duration": item.duration,
-                    "status": item.status.value,
-                }
-                for item in runs
-            ]
-
-            # Optional enrichment: common error from today's failures.
-            failure_messages = (
-                db.query(PipelineRunFile.error_message, func.count(PipelineRunFile.id))
-                .join(PipelineRun, PipelineRun.id == PipelineRunFile.run_id)
-                .filter(
-                    PipelineRun.created_at >= day_start,
-                    PipelineRun.created_at < day_end,
-                    PipelineRunFile.status == PipelineRunStatus.FAILED,
-                    PipelineRunFile.error_message != "",
-                )
-                .group_by(PipelineRunFile.error_message)
-                .all()
-            )
-            if failure_messages:
-                common_error = Counter({msg: count for msg, count in failure_messages}).most_common(1)[0][0]
-            else:
-                common_error = ""
-
-            payload = {
-                "date": today,
-                "runs": run_rows,
-                "totals": {"runs": total_runs, "files": total_files, "success": total_success, "failure": total_failure},
-                "common_error": common_error,
-            }
-            subject = f"📊 Daily Pipeline Summary | {today.isoformat()}"
-            html_content = build_eod_summary_email(payload)
-            attachment_name = f"daily_pipeline_summary_{today.isoformat()}.xlsx"
-            attachment_bytes = self._build_eod_summary_xlsx(
-                report_date=today,
-                runs=run_rows,
-                totals={
-                    "runs": total_runs,
-                    "files": total_files,
-                    "success": total_success,
-                    "failure": total_failure,
-                },
-            )
-            recipients = self._get_notification_emails()
-            if not recipients:
-                logger.info("Skipping EOD summary email: no recipients")
-            else:
-                for recipient in recipients:
-                    send_email(
-                        to_email=recipient,
-                        subject=subject,
-                        html_content=html_content,
-                        attachments=[
-                            (
-                                attachment_name,
-                                attachment_bytes,
-                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            )
-                        ],
+                day_start = datetime.combine(today, datetime.min.time())
+                day_end = day_start + timedelta(days=1)
+                runs = (
+                    await db.execute(
+                        select(PipelineRun)
+                        .where(PipelineRun.created_at >= day_start, PipelineRun.created_at < day_end)
+                        .order_by(PipelineRun.start_time.asc())
                     )
-                logger.info("EOD summary sent: date=%s recipients=%s", today.isoformat(), ",".join(recipients))
+                ).scalars().all()
+                total_runs = len(runs)
+                total_files = sum(int(item.total_files or 0) for item in runs)
+                total_success = sum(int(item.success_count or 0) for item in runs)
+                total_failure = sum(int(item.failure_count or 0) for item in runs)
 
-            settings_row.last_sent_date = today
-            db.add(settings_row)
-            db.commit()
-        except EmailServiceError:
-            db.rollback()
-            logger.exception("Failed to send EOD summary email")
-        except Exception:
-            db.rollback()
-            logger.exception("Failed during EOD summary processing")
-        finally:
-            db.close()
+                run_rows = [
+                    {
+                        "run_id": item.run_id,
+                        "start_time": item.start_time,
+                        "total_files": item.total_files,
+                        "success_count": item.success_count,
+                        "failure_count": item.failure_count,
+                        "duration": item.duration,
+                        "status": item.status.value,
+                    }
+                    for item in runs
+                ]
+
+                failure_messages = (
+                    await db.execute(
+                        select(PipelineRunFile.error_message, func.count(PipelineRunFile.id))
+                        .join(PipelineRun, PipelineRun.id == PipelineRunFile.run_id)
+                        .where(
+                            PipelineRun.created_at >= day_start,
+                            PipelineRun.created_at < day_end,
+                            PipelineRunFile.status == PipelineRunStatus.FAILED,
+                            PipelineRunFile.error_message != "",
+                        )
+                        .group_by(PipelineRunFile.error_message)
+                    )
+                ).all()
+                if failure_messages:
+                    common_error = Counter({msg: count for msg, count in failure_messages}).most_common(1)[0][0]
+                else:
+                    common_error = ""
+
+                payload = {
+                    "date": today,
+                    "runs": run_rows,
+                    "totals": {"runs": total_runs, "files": total_files, "success": total_success, "failure": total_failure},
+                    "common_error": common_error,
+                }
+                subject = f"📊 Daily Pipeline Summary | {today.isoformat()}"
+                html_content = build_eod_summary_email(payload)
+                attachment_name = f"daily_pipeline_summary_{today.isoformat()}.xlsx"
+                attachment_bytes = self._build_eod_summary_xlsx(
+                    report_date=today,
+                    runs=run_rows,
+                    totals={
+                        "runs": total_runs,
+                        "files": total_files,
+                        "success": total_success,
+                        "failure": total_failure,
+                    },
+                )
+                recipients = await self._get_notification_emails()
+                if not recipients:
+                    logger.info("Skipping EOD summary email: no recipients")
+                else:
+                    for recipient in recipients:
+                        await send_email(
+                            to_email=recipient,
+                            subject=subject,
+                            html_content=html_content,
+                            attachments=[
+                                (
+                                    attachment_name,
+                                    attachment_bytes,
+                                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                )
+                            ],
+                        )
+                    logger.info("EOD summary sent: date=%s recipients=%s", today.isoformat(), ",".join(recipients))
+
+                settings_row.last_sent_date = today
+                db.add(settings_row)
+                await db.commit()
+            except EmailServiceError:
+                await db.rollback()
+                logger.exception("Failed to send EOD summary email")
+            except Exception:
+                await db.rollback()
+                logger.exception("Failed during EOD summary processing")
 
     @staticmethod
     def _build_eod_summary_xlsx(
@@ -968,7 +969,7 @@ class Scheduler:
         workbook.save(output)
         return output.getvalue()
 
-    def _upload_onedrive_outputs(
+    async def _upload_onedrive_outputs(
         self,
         tagged_pdf_path: str,
         report_path: str,
@@ -979,15 +980,15 @@ class Scheduler:
 
         tagged_path_obj = Path(tagged_pdf_path)
         report_path_obj = Path(report_path)
-        self.onedrive_client.upload_file(
-            access_token=self._get_onedrive_access_token(),
+        await self.onedrive_client.upload_file(
+            access_token=await self._get_onedrive_access_token(),
             local_path=tagged_path_obj,
             folder_path=OUTPUT_SUCCESS_FOLDER,
             filename=tagged_path_obj.name,
         )
         logger.info("Upload success to OneDrive: local=%s target_folder=%s", tagged_path_obj, OUTPUT_SUCCESS_FOLDER)
-        self.onedrive_client.upload_file(
-            access_token=self._get_onedrive_access_token(),
+        await self.onedrive_client.upload_file(
+            access_token=await self._get_onedrive_access_token(),
             local_path=report_path_obj,
             folder_path=OUTPUT_SUCCESS_FOLDER,
             filename=report_path_obj.name,
@@ -996,22 +997,19 @@ class Scheduler:
         if autotag_report_path:
             autotag_report_obj = Path(autotag_report_path)
             if autotag_report_obj.exists():
-                self.onedrive_client.upload_file(
-                    access_token=self._get_onedrive_access_token(),
+                await self.onedrive_client.upload_file(
+                    access_token=await self._get_onedrive_access_token(),
                     local_path=autotag_report_obj,
                     folder_path=OUTPUT_SUCCESS_FOLDER,
                     filename=autotag_report_obj.name,
                 )
                 logger.info("Upload success to OneDrive: local=%s target_folder=%s", autotag_report_obj, OUTPUT_SUCCESS_FOLDER)
 
-    def _get_onedrive_access_token(self) -> str:
+    async def _get_onedrive_access_token(self) -> str:
         if not self.auth_service:
             raise MicrosoftAuthError("Microsoft auth service is not initialized.")
-        db = SessionLocal()
-        try:
-            return self.auth_service.get_valid_access_token(db=db)
-        finally:
-            db.close()
+        async with SessionLocal() as db:
+            return await self.auth_service.get_valid_access_token(db=db)
 
     @staticmethod
     def _is_processible_file(path: Path) -> tuple[bool, str]:
@@ -1027,7 +1025,7 @@ class Scheduler:
             return False, "ignore"
 
         lower_name = name.lower()
-        if any(marker in lower_name for marker in GENERATED_MARKERS):
+        if any(lower_name.endswith(suffix) for suffix in GENERATED_ARTIFACT_SUFFIXES):
             return False, "generated"
 
         suffix = Path(name).suffix.lower()

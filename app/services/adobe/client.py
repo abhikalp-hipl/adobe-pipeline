@@ -1,4 +1,5 @@
 # pyright: reportMissingImports=false
+import asyncio
 import logging
 import os
 from pathlib import Path
@@ -202,6 +203,20 @@ class AdobeClient:
             logger.exception("Adobe accessibility_check failed: input=%s", source)
             raise AdobeAPIError("Failed to run accessibility check.") from exc
         return report_output_path
+
+    async def convert_to_pdf_async(self, input_path: str | Path, output_dir: str | Path | None = None) -> Path:
+        return await asyncio.to_thread(self.convert_to_pdf, input_path, output_dir)
+
+    async def auto_tag_async(
+        self,
+        input_path: str | Path,
+        output_dir: str | Path | None = None,
+        report_dir: str | Path | None = None,
+    ) -> tuple[Path, Path | None]:
+        return await asyncio.to_thread(self.auto_tag, input_path, output_dir, report_dir)
+
+    async def check_accessibility_async(self, input_path: str | Path, report_dir: str | Path | None = None) -> Path:
+        return await asyncio.to_thread(self.check_accessibility, input_path, report_dir)
 
     @staticmethod
     def _guess_media_type(path: Path) -> PDFServicesMediaType:

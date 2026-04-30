@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   Calendar,
@@ -273,62 +273,70 @@ function Dashboard() {
   const [isViewerLoading, setIsViewerLoading] = useState(false);
   const lastSuccessKeyRef = useRef("");
   const wasRunningRef = useRef(false);
+  const activePageRef = useRef(activePage);
+  const selectedFolderRef = useRef(selectedFolder);
+  const lastTerminalRefreshAtRef = useRef(0);
+  const runFilesByRunIdRef = useRef(runFilesByRunId);
 
   const intervalOptions = [1, 2, 5, 10, 15, 30, 60];
   const isRunning = Boolean(pipelineStatus?.is_running);
   const showRunningState = isRunning || isRunNowPending;
 
-  useEffect(() => {
-    const fetchFiles = async () => {
-      setIsLoadingFiles(true);
-      setError("");
-      setFiles([]);
-      setSelectedFile(null);
-      setFileContent(null);
-      setXlsxContent(null);
-      try {
-        const response = await getFiles(selectedFolder);
-        // eslint-disable-next-line no-console
-        console.log("Mapped files", response);
-        setFiles(response);
-        setLastUpdatedAt(new Date().toISOString());
-      } catch (requestError) {
-        setError(requestError?.response?.data?.detail || "Failed to fetch files.");
-      } finally {
-        setIsLoadingFiles(false);
-      }
-    };
-    fetchFiles();
-  }, [selectedFolder]);
-
-  useEffect(() => {
-    let cancelled = false;
-    const fetchCounts = async () => {
-      try {
-        const [intake, processed, outputSuccess, outputFailure] = await Promise.all([
-          getFiles("intake"),
-          getFiles("processed"),
-          getFiles("output/success"),
-          getFiles("output/failure"),
-        ]);
-        if (cancelled) return;
-        setFolderCounts({
-          intake: Array.isArray(intake) ? intake.length : 0,
-          processed: Array.isArray(processed) ? processed.length : 0,
-          "output/success": Array.isArray(outputSuccess) ? outputSuccess.length : 0,
-          "output/failure": Array.isArray(outputFailure) ? outputFailure.length : 0,
-        });
-      } catch {
-        // ignore count errors
-      }
-    };
-    fetchCounts();
-    return () => {
-      cancelled = true;
-    };
+  const refreshFolderCounts = useCallback(async () => {
+    try {
+      const [intake, processed, outputSuccess, outputFailure] = await Promise.all([
+        getFiles("intake"),
+        getFiles("processed"),
+        getFiles("output/success"),
+        getFiles("output/failure"),
+      ]);
+      setFolderCounts({
+        intake: Array.isArray(intake) ? intake.length : 0,
+        processed: Array.isArray(processed) ? processed.length : 0,
+        "output/success": Array.isArray(outputSuccess) ? outputSuccess.length : 0,
+        "output/failure": Array.isArray(outputFailure) ? outputFailure.length : 0,
+      });
+    } catch {
+      // ignore count errors
+    }
   }, []);
 
-  const refreshDashboard = async () => {
+  const refreshSelectedFolderFiles = useCallback(async () => {
+    setIsLoadingFiles(true);
+    setError("");
+    setFiles([]);
+    setSelectedFile(null);
+    setFileContent(null);
+    setXlsxContent(null);
+    try {
+      const response = await getFiles(selectedFolderRef.current);
+      setFiles(response);
+      setLastUpdatedAt(new Date().toISOString());
+    } catch (requestError) {
+      setError(requestError?.response?.data?.detail || "Failed to fetch files.");
+    } finally {
+      setIsLoadingFiles(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    selectedFolderRef.current = selectedFolder;
+    refreshSelectedFolderFiles();
+  }, [selectedFolder, refreshSelectedFolderFiles]);
+
+  useEffect(() => {
+    activePageRef.current = activePage;
+  }, [activePage]);
+
+  useEffect(() => {
+    runFilesByRunIdRef.current = runFilesByRunId;
+  }, [runFilesByRunId]);
+
+  useEffect(() => {
+    refreshFolderCounts();
+  }, [selectedFolder, refreshFolderCounts]);
+
+  const refreshDashboard = useCallback(async ({ full = false } = {}) => {
     setIsLoadingDashboardFiles((dashboardFiles || []).length === 0);
     try {
       const data = await getRuns();
@@ -343,14 +351,26 @@ function Dashboard() {
         writeSessionCache(DASHBOARD_CACHE_KEYS.dashboardUpdatedAt, updatedAt);
         return;
       }
-      // Pull a wide window so older non-empty runs are still visible
-      // when several latest runs have zero processed files.
-      const candidateRuns = nextRuns.slice(0, 100);
-      const settledRows = await Promise.allSettled(candidateRuns.map((item) => getRunFiles(item.run_id)));
-      const successfulRows = settledRows
-        .filter((entry) => entry.status === "fulfilled")
-        .map((entry) => entry.value);
-      const normalized = successfulRows.flatMap((group) => normalizeRunFiles(group)).filter((item) => Boolean(item?.name));
+      // Fast path for live refresh: only fetch missing recent runs.
+      const candidateRuns = nextRuns.slice(0, full ? 100 : 20);
+      const existingRunFiles = runFilesByRunIdRef.current || {};
+      const idsToFetch = candidateRuns
+        .map((item) => item.run_id)
+        .filter((runId) => full || !existingRunFiles[runId]);
+      const settledRows = await Promise.allSettled(idsToFetch.map((runId) => getRunFiles(runId)));
+      const fetchedRunFilesById = {};
+      settledRows.forEach((entry, idx) => {
+        if (entry.status === "fulfilled") {
+          fetchedRunFilesById[idsToFetch[idx]] = normalizeRunFiles(entry.value);
+        }
+      });
+      const mergedRunFilesById = { ...existingRunFiles, ...fetchedRunFilesById };
+      setRunFilesByRunId(mergedRunFilesById);
+      writeSessionCache(DASHBOARD_CACHE_KEYS.runFilesByRunId, mergedRunFilesById);
+
+      const normalized = candidateRuns
+        .flatMap((run) => mergedRunFilesById[run.run_id] || [])
+        .filter((item) => Boolean(item?.name));
       normalized.sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
       const nextDashboardFiles = normalized;
       setDashboardFiles(nextDashboardFiles);
@@ -363,7 +383,7 @@ function Dashboard() {
     } finally {
       setIsLoadingDashboardFiles(false);
     }
-  };
+  }, [dashboardFiles]);
 
   useEffect(() => {
     let cancelled = false;
@@ -393,7 +413,7 @@ function Dashboard() {
   }, []);
 
   useEffect(() => {
-    refreshDashboard();
+    refreshDashboard({ full: true });
   }, []);
 
   useEffect(() => {
@@ -527,8 +547,26 @@ function Dashboard() {
           lastSuccessKeyRef.current = key;
           setSuccess({ file: data?.current_file || "" });
           refreshDashboard();
-          if (activePage === "folder") {
-            setSelectedFolder((prev) => prev);
+          refreshFolderCounts();
+          if (activePageRef.current === "folder") {
+            refreshSelectedFolderFiles();
+          }
+        }
+      }
+
+      if (prevWasRunning && !nextIsRunning && data?.current_step === "FAILED") {
+        refreshDashboard();
+        refreshFolderCounts();
+      }
+
+      if (!nextIsRunning && (data?.current_step === "COMPLETED" || data?.current_step === "FAILED")) {
+        const now = Date.now();
+        if (now - lastTerminalRefreshAtRef.current > 1500) {
+          lastTerminalRefreshAtRef.current = now;
+          refreshDashboard();
+          refreshFolderCounts();
+          if (activePageRef.current === "folder") {
+            refreshSelectedFolderFiles();
           }
         }
       }
@@ -587,7 +625,7 @@ function Dashboard() {
         ws.close();
       }
     };
-  }, []);
+  }, [refreshDashboard, refreshFolderCounts, refreshSelectedFolderFiles]);
 
   useEffect(() => {
     let cancelled = false;

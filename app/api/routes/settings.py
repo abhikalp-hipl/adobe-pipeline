@@ -2,7 +2,8 @@ import re
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, ConfigDict, field_validator
-from sqlalchemy.orm import Session
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.database import get_db
 from app.db.models import NotificationSettings
@@ -33,28 +34,28 @@ class NotificationSettingsResponse(BaseModel):
     scheduler_interval_seconds: int
 
 
-def _get_or_create_settings(db: Session) -> NotificationSettings:
-    settings_row = db.query(NotificationSettings).order_by(NotificationSettings.created_at.asc()).first()
+async def _get_or_create_settings(db: AsyncSession) -> NotificationSettings:
+    settings_row = (await db.execute(select(NotificationSettings).order_by(NotificationSettings.created_at.asc()))).scalars().first()
     if settings_row:
         return settings_row
     settings_row = NotificationSettings(eod_time="18:00", enabled=False, scheduler_interval_seconds=300)
     db.add(settings_row)
-    db.commit()
-    db.refresh(settings_row)
+    await db.commit()
+    await db.refresh(settings_row)
     return settings_row
 
 
 @router.get("/settings", response_model=NotificationSettingsResponse)
-def get_settings(db: Session = Depends(get_db)) -> NotificationSettings:
-    return _get_or_create_settings(db=db)
+async def get_settings(db: AsyncSession = Depends(get_db)) -> NotificationSettings:
+    return await _get_or_create_settings(db=db)
 
 
 @router.post("/settings", response_model=NotificationSettingsResponse)
-def update_settings(payload: NotificationSettingsPayload, db: Session = Depends(get_db)) -> NotificationSettings:
-    settings_row = _get_or_create_settings(db=db)
+async def update_settings(payload: NotificationSettingsPayload, db: AsyncSession = Depends(get_db)) -> NotificationSettings:
+    settings_row = await _get_or_create_settings(db=db)
     settings_row.eod_time = payload.eod_time
     settings_row.enabled = payload.enabled
     db.add(settings_row)
-    db.commit()
-    db.refresh(settings_row)
+    await db.commit()
+    await db.refresh(settings_row)
     return settings_row

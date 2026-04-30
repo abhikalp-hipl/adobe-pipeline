@@ -3,9 +3,7 @@ import logging
 from pathlib import Path
 from urllib.parse import quote
 
-import requests
-from requests import Response
-from requests.exceptions import RequestException
+import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -33,10 +31,10 @@ class OneDriveClient:
     def __init__(self, timeout_seconds: int = 30) -> None:
         self.timeout_seconds = timeout_seconds
 
-    def list_files(self, access_token: str, folder_path: str) -> list[dict]:
+    async def list_files(self, access_token: str, folder_path: str) -> list[dict]:
         encoded_folder = quote(folder_path.strip("/"), safe="/")
         endpoint = f"/root:/{encoded_folder}:/children"
-        response = self._request(access_token, "GET", endpoint)
+        response = await self._request(access_token, "GET", endpoint)
         payload = response.json()
         logger.info("OneDrive list_files response: status=%s endpoint=%s", response.status_code, endpoint)
         logger.info("OneDrive list_files payload: %s", payload)
@@ -62,30 +60,31 @@ class OneDriveClient:
                 )
         return files
 
-    def get_item_metadata(self, access_token: str, file_id: str) -> dict:
-        response = self._request(access_token, "GET", f"/items/{file_id}")
+    async def get_item_metadata(self, access_token: str, file_id: str) -> dict:
+        response = await self._request(access_token, "GET", f"/items/{file_id}")
         return response.json()
 
-    def get_file_content(self, access_token: str, file_id: str) -> Response:
-        return self._request(access_token, "GET", f"/items/{file_id}/content", stream=True)
+    async def get_file_content(self, access_token: str, file_id: str) -> bytes:
+        response = await self._request(access_token, "GET", f"/items/{file_id}/content")
+        return response.content
 
-    def get_file_content_as_pdf(self, access_token: str, file_id: str) -> Response:
-        return self._request(
+    async def get_file_content_as_pdf(self, access_token: str, file_id: str) -> bytes:
+        response = await self._request(
             access_token,
             "GET",
             f"/items/{file_id}/content",
             params={"format": "pdf"},
-            stream=True,
         )
+        return response.content
 
-    def create_share_link(
+    async def create_share_link(
         self,
         access_token: str,
         file_id: str,
         link_type: str = "view",
         scope: str = "anonymous",
     ) -> str:
-        response = self._request(
+        response = await self._request(
             access_token,
             "POST",
             f"/items/{file_id}/createLink",
@@ -97,20 +96,18 @@ class OneDriveClient:
             raise OneDriveError("Microsoft Graph createLink response missing link.webUrl.")
         return web_url
 
-    def download_file(self, access_token: str, file_id: str, local_path: str | Path) -> Path:
+    async def download_file(self, access_token: str, file_id: str, local_path: str | Path) -> Path:
         destination = Path(local_path)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        response = self._request(access_token, "GET", f"/items/{file_id}/content", stream=True)
+        response = await self._request(access_token, "GET", f"/items/{file_id}/content")
         try:
             with destination.open("wb") as target:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        target.write(chunk)
+                target.write(response.content)
         except OSError as exc:
             raise OneDriveError(f"Failed to save downloaded file to '{destination}'.") from exc
         return destination
 
-    def upload_file(self, access_token: str, local_path: str | Path, folder_path: str, filename: str) -> dict:
+    async def upload_file(self, access_token: str, local_path: str | Path, folder_path: str, filename: str) -> dict:
         source = Path(local_path)
         if not source.exists():
             raise OneDriveNotFoundError(f"Upload source file not found: {source}")
@@ -120,15 +117,15 @@ class OneDriveClient:
         upload_endpoint = f"/root:/{encoded_folder}/{encoded_filename}:/content"
         try:
             with source.open("rb") as file_obj:
-                response = self._request(access_token, "PUT", upload_endpoint, data=file_obj.read())
+                response = await self._request(access_token, "PUT", upload_endpoint, content=file_obj.read())
             return response.json()
         except OSError as exc:
             raise OneDriveError(f"Failed to read upload source file '{source}'.") from exc
 
-    def delete_file(self, access_token: str, file_id: str) -> None:
-        self._request(access_token, "DELETE", f"/items/{file_id}")
+    async def delete_file(self, access_token: str, file_id: str) -> None:
+        await self._request(access_token, "DELETE", f"/items/{file_id}")
 
-    def move_file(
+    async def move_file(
         self,
         access_token: str,
         file_id: str,
@@ -143,7 +140,7 @@ class OneDriveClient:
         }
         if filename:
             payload["name"] = filename
-        response = self._request(access_token, "PATCH", f"/items/{file_id}", json=payload)
+        response = await self._request(access_token, "PATCH", f"/items/{file_id}", json=payload)
         return response.json()
 
     @staticmethod
@@ -153,21 +150,21 @@ class OneDriveClient:
             raise OneDriveAuthError("A delegated Microsoft Graph access token is required.")
         return token
 
-    def _request(self, access_token: str, method: str, endpoint: str, **kwargs) -> Response:
+    async def _request(self, access_token: str, method: str, endpoint: str, **kwargs) -> httpx.Response:
         token = self._require_token(access_token)
         headers = kwargs.pop("headers", {})
         headers["Authorization"] = f"Bearer {token}"
         url = f"{self.BASE_URL}{endpoint}"
 
         try:
-            response = requests.request(
-                method,
-                url,
-                headers=headers,
-                timeout=self.timeout_seconds,
-                **kwargs,
-            )
-        except RequestException as exc:
+            async with httpx.AsyncClient(timeout=self.timeout_seconds, follow_redirects=True) as client:
+                response = await client.request(
+                    method,
+                    url,
+                    headers=headers,
+                    **kwargs,
+                )
+        except httpx.HTTPError as exc:
             raise OneDriveError(f"Microsoft Graph request failed: {method} {url}") from exc
 
         if response.status_code == 404:
@@ -182,14 +179,14 @@ class OneDriveClient:
         return response
 
 
-def _request_with_retry(
+async def _request_with_retry(
     method: str,
     url: str,
     access_token: str,
     *,
     timeout_seconds: int,
     json_payload: dict | None = None,
-) -> requests.Response:
+) -> httpx.Response:
     headers = {
         "Authorization": f"Bearer {access_token}",
     }
@@ -199,13 +196,13 @@ def _request_with_retry(
     last_error: Exception | None = None
     for attempt in range(2):
         try:
-            response = requests.request(
-                method=method,
-                url=url,
-                headers=headers,
-                json=json_payload,
-                timeout=timeout_seconds,
-            )
+            async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+                response = await client.request(
+                    method=method,
+                    url=url,
+                    headers=headers,
+                    json=json_payload,
+                )
             if response.status_code >= 500 and attempt == 0:
                 logger.warning(
                     "Transient Graph API error, retrying once: method=%s url=%s status=%s",
@@ -215,7 +212,7 @@ def _request_with_retry(
                 )
                 continue
             return response
-        except RequestException as exc:
+        except httpx.HTTPError as exc:
             last_error = exc
             if attempt == 0:
                 logger.warning(
@@ -240,8 +237,7 @@ async def ensure_folder(path: str, access_token: str, timeout_seconds: int = 30)
     for part in parts:
         current_path = f"{current_path}/{part}" if current_path else part
         check_url = f"https://graph.microsoft.com/v1.0/me/drive/root:/{current_path}"
-        check_response = await asyncio.to_thread(
-            _request_with_retry,
+        check_response = await _request_with_retry(
             "GET",
             check_url,
             token,
@@ -255,8 +251,7 @@ async def ensure_folder(path: str, access_token: str, timeout_seconds: int = 30)
                 if not parent
                 else f"https://graph.microsoft.com/v1.0/me/drive/root:/{parent}:/children"
             )
-            create_response = await asyncio.to_thread(
-                _request_with_retry,
+            create_response = await _request_with_retry(
                 "POST",
                 create_url,
                 token,

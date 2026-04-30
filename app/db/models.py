@@ -137,6 +137,9 @@ class PipelineRunFile(Base):
     output_stem: Mapped[str | None] = mapped_column(String(512), nullable=True)
     status: Mapped[PipelineRunStatus] = mapped_column(Enum(PipelineRunStatus), nullable=False)
     error_message: Mapped[str] = mapped_column(String, nullable=False, default="")
+    accessibility_passed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    accessibility_failed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    accessibility_manual: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

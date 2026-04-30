@@ -3,7 +3,8 @@ from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy.orm import Session
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.database import get_db
 from app.db.models import PipelineRun, PipelineRunFile, PipelineRunStatus
@@ -48,33 +49,37 @@ class PipelineRunDetailsResponse(BaseModel):
 
 
 @router.get("/runs", response_model=list[PipelineRunListItem])
-def list_runs(db: Session = Depends(get_db)) -> list[PipelineRun]:
-    return db.query(PipelineRun).order_by(PipelineRun.start_time.desc()).all()
+async def list_runs(db: AsyncSession = Depends(get_db)) -> list[PipelineRun]:
+    return (await db.execute(select(PipelineRun).order_by(PipelineRun.start_time.desc()))).scalars().all()
 
 
 @router.get("/runs/{run_id}/files", response_model=list[PipelineRunFileItem])
-def list_run_files(run_id: str, db: Session = Depends(get_db)) -> list[PipelineRunFile]:
-    run = db.query(PipelineRun).filter(PipelineRun.run_id == run_id).first()
+async def list_run_files(run_id: str, db: AsyncSession = Depends(get_db)) -> list[PipelineRunFile]:
+    run = (await db.execute(select(PipelineRun).where(PipelineRun.run_id == run_id))).scalars().first()
     if not run:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found.")
-    rows = db.query(PipelineRunFile).filter(PipelineRunFile.run_id == run.id).order_by(PipelineRunFile.created_at.asc()).all()
-    output_lookup, _grouped_outputs = _build_output_catalog(db=db)
+    rows = (
+        await db.execute(select(PipelineRunFile).where(PipelineRunFile.run_id == run.id).order_by(PipelineRunFile.created_at.asc()))
+    ).scalars().all()
+    output_lookup, _grouped_outputs = await _build_output_catalog(db=db)
     response: list[PipelineRunFileItem] = []
     for row in rows:
-        response.append(_to_run_file_item(row, output_lookup=output_lookup))
+        response.append(await _to_run_file_item(row, output_lookup=output_lookup))
     return response
 
 
 @router.get("/runs/{run_id}", response_model=PipelineRunDetailsResponse)
-def get_run_details(run_id: str, db: Session = Depends(get_db)) -> PipelineRunDetailsResponse:
-    run = db.query(PipelineRun).filter(PipelineRun.run_id == run_id).first()
+async def get_run_details(run_id: str, db: AsyncSession = Depends(get_db)) -> PipelineRunDetailsResponse:
+    run = (await db.execute(select(PipelineRun).where(PipelineRun.run_id == run_id))).scalars().first()
     if not run:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found.")
-    rows = db.query(PipelineRunFile).filter(PipelineRunFile.run_id == run.id).order_by(PipelineRunFile.created_at.asc()).all()
-    output_lookup, _grouped_outputs = _build_output_catalog(db=db)
+    rows = (
+        await db.execute(select(PipelineRunFile).where(PipelineRunFile.run_id == run.id).order_by(PipelineRunFile.created_at.asc()))
+    ).scalars().all()
+    output_lookup, _grouped_outputs = await _build_output_catalog(db=db)
     files: list[PipelineRunFileItem] = []
     for row in rows:
-        files.append(_to_run_file_item(row, output_lookup=output_lookup))
+        files.append(await _to_run_file_item(row, output_lookup=output_lookup))
     return PipelineRunDetailsResponse(
         run_id=run.run_id,
         start_time=run.start_time,
@@ -87,7 +92,7 @@ def get_run_details(run_id: str, db: Session = Depends(get_db)) -> PipelineRunDe
     )
 
 
-def _to_run_file_item(
+async def _to_run_file_item(
     row: PipelineRunFile,
     output_lookup: dict[str, str],
 ) -> PipelineRunFileItem:
@@ -118,7 +123,17 @@ def _to_run_file_item(
         "json_url": f"/file-content?id={json_id}" if json_id else None,
         "xlsx_url": f"/file-content?id={xlsx_id}" if xlsx_id else None,
     }
-    accessibility = {"passed": 0, "failed": 0, "manual": 0} if is_failed else _read_accessibility_counts(json_file_id=json_id)
+    stored_accessibility = {
+        "passed": int(getattr(row, "accessibility_passed", 0) or 0),
+        "failed": int(getattr(row, "accessibility_failed", 0) or 0),
+        "manual": int(getattr(row, "accessibility_manual", 0) or 0),
+    }
+    has_non_zero_stored_values = any(value > 0 for value in stored_accessibility.values())
+    if is_failed or not json_id or has_non_zero_stored_values:
+        accessibility = stored_accessibility
+    else:
+        # Backward compatibility for older rows created before accessibility counters were persisted.
+        accessibility = await _read_accessibility_counts(json_file_id=json_id)
     return PipelineRunFileItem(
         name=row.file_name,
         status=row.status,
@@ -140,12 +155,12 @@ def _derive_output_stem(file_name: str) -> str:
     return file_name
 
 
-def _build_output_catalog(db: Session) -> tuple[dict[str, str], dict[str, dict[str, str]]]:
+async def _build_output_catalog(db: AsyncSession) -> tuple[dict[str, str], dict[str, dict[str, str]]]:
     auth_service = MicrosoftAuthService()
     onedrive_client = OneDriveClient()
     try:
-        access_token = auth_service.get_valid_access_token(db=db)
-        files = onedrive_client.list_files(access_token=access_token, folder_path=OUTPUT_SUCCESS_FOLDER)
+        access_token = await auth_service.get_valid_access_token(db=db)
+        files = await onedrive_client.list_files(access_token=access_token, folder_path=OUTPUT_SUCCESS_FOLDER)
         lookup = {item.get("name", ""): item.get("id", "") for item in files if item.get("name") and item.get("id")}
         grouped: dict[str, dict[str, str]] = {}
         for item in files:
@@ -190,23 +205,22 @@ def _resolve_output_id(output_lookup: dict[str, str], stem: str, candidates: lis
     return ""
 
 
-def _read_accessibility_counts(json_file_id: str) -> dict[str, int]:
+async def _read_accessibility_counts(json_file_id: str) -> dict[str, int]:
     if not json_file_id:
         return {"passed": 0, "failed": 0, "manual": 0}
-    db = next(get_db())
-    try:
-        auth_service = MicrosoftAuthService()
-        onedrive_client = OneDriveClient()
-        access_token = auth_service.get_valid_access_token(db=db)
-        response = onedrive_client.get_file_content(access_token=access_token, file_id=json_file_id)
-        payload = json.loads(response.content.decode("utf-8"))
-        summary = payload.get("Summary") if isinstance(payload, dict) else {}
-        return {
-            "passed": int((summary or {}).get("Passed", 0)) + int((summary or {}).get("Passed manually", 0)),
-            "failed": int((summary or {}).get("Failed", 0)) + int((summary or {}).get("Failed manually", 0)),
-            "manual": int((summary or {}).get("Needs manual check", 0)),
-        }
-    except Exception:
-        return {"passed": 0, "failed": 0, "manual": 0}
-    finally:
-        db.close()
+    async for db in get_db():
+        try:
+            auth_service = MicrosoftAuthService()
+            onedrive_client = OneDriveClient()
+            access_token = await auth_service.get_valid_access_token(db=db)
+            content = await onedrive_client.get_file_content(access_token=access_token, file_id=json_file_id)
+            payload = json.loads(content.decode("utf-8"))
+            summary = payload.get("Summary") if isinstance(payload, dict) else {}
+            return {
+                "passed": int((summary or {}).get("Passed", 0)) + int((summary or {}).get("Passed manually", 0)),
+                "failed": int((summary or {}).get("Failed", 0)) + int((summary or {}).get("Failed manually", 0)),
+                "manual": int((summary or {}).get("Needs manual check", 0)),
+            }
+        except Exception:
+            return {"passed": 0, "failed": 0, "manual": 0}
+    return {"passed": 0, "failed": 0, "manual": 0}

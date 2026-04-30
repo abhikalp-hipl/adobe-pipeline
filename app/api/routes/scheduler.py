@@ -1,5 +1,6 @@
 from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 
 from app.db.database import SessionLocal
 from app.db.models import NotificationSettings
@@ -34,7 +35,7 @@ def _get_scheduler(request: Request) -> Scheduler:
 
 
 @router.get("", response_model=SchedulerStatusResponse)
-def get_scheduler_status(request: Request) -> SchedulerStatusResponse:
+async def get_scheduler_status(request: Request) -> SchedulerStatusResponse:
     scheduler = _get_scheduler(request=request)
     return SchedulerStatusResponse(
         interval=scheduler.interval,
@@ -45,7 +46,7 @@ def get_scheduler_status(request: Request) -> SchedulerStatusResponse:
 
 
 @router.post("/interval", response_model=SchedulerStatusResponse)
-def update_scheduler_interval(
+async def update_scheduler_interval(
     payload: SchedulerIntervalUpdateRequest,
     request: Request,
 ) -> SchedulerStatusResponse:
@@ -56,7 +57,7 @@ def update_scheduler_interval(
             detail="Scheduler interval updates are disabled for OneDrive delegated mode.",
         )
     scheduler.update_interval(new_interval=payload.interval)
-    _persist_scheduler_interval(new_interval=payload.interval)
+    await _persist_scheduler_interval(new_interval=payload.interval)
     return SchedulerStatusResponse(
         interval=scheduler.interval,
         status=scheduler.status(),
@@ -66,16 +67,15 @@ def update_scheduler_interval(
 
 
 @router.post("/run-now", response_model=RunNowResponse)
-def run_scheduler_now(request: Request) -> RunNowResponse:
+async def run_scheduler_now(request: Request) -> RunNowResponse:
     scheduler = _get_scheduler(request=request)
-    scheduler.run_once()
+    await scheduler.run_once()
     return RunNowResponse(detail="Processing started")
 
 
-def _persist_scheduler_interval(new_interval: int) -> None:
-    db = SessionLocal()
-    try:
-        settings_row = db.query(NotificationSettings).order_by(NotificationSettings.created_at.asc()).first()
+async def _persist_scheduler_interval(new_interval: int) -> None:
+    async with SessionLocal() as db:
+        settings_row = (await db.execute(select(NotificationSettings).order_by(NotificationSettings.created_at.asc()))).scalars().first()
         if not settings_row:
             settings_row = NotificationSettings(
                 eod_time="18:00",
@@ -85,6 +85,4 @@ def _persist_scheduler_interval(new_interval: int) -> None:
         else:
             settings_row.scheduler_interval_seconds = new_interval
         db.add(settings_row)
-        db.commit()
-    finally:
-        db.close()
+        await db.commit()

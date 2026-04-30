@@ -5,9 +5,9 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from urllib.parse import urlencode
 
-import requests
-from requests.exceptions import RequestException
-from sqlalchemy.orm import Session
+import httpx
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.db.models import UserToken
@@ -57,7 +57,7 @@ class MicrosoftAuthService:
     def generate_state() -> str:
         return secrets.token_urlsafe(32)
 
-    def exchange_code_for_tokens(self, code: str) -> MicrosoftTokenPayload:
+    async def exchange_code_for_tokens(self, code: str) -> MicrosoftTokenPayload:
         body = {
             "client_id": settings.MS_CLIENT_ID,
             "client_secret": settings.MS_CLIENT_SECRET,
@@ -66,9 +66,9 @@ class MicrosoftAuthService:
             "grant_type": "authorization_code",
             "scope": MS_OAUTH_SCOPE,
         }
-        return self._request_token(body=body, require_identity_claims=True)
+        return await self._request_token(body=body, require_identity_claims=True)
 
-    def refresh_access_token(self, refresh_token: str) -> MicrosoftTokenPayload:
+    async def refresh_access_token(self, refresh_token: str) -> MicrosoftTokenPayload:
         body = {
             "client_id": settings.MS_CLIENT_ID,
             "client_secret": settings.MS_CLIENT_SECRET,
@@ -76,10 +76,10 @@ class MicrosoftAuthService:
             "grant_type": "refresh_token",
             "scope": MS_OAUTH_SCOPE,
         }
-        return self._request_token(body=body, require_identity_claims=False)
+        return await self._request_token(body=body, require_identity_claims=False)
 
-    def get_valid_access_token(self, db: Session) -> str:
-        token_row = db.query(UserToken).order_by(UserToken.updated_at.desc()).first()
+    async def get_valid_access_token(self, db: AsyncSession) -> str:
+        token_row = (await db.execute(select(UserToken).order_by(UserToken.updated_at.desc()))).scalars().first()
         if not token_row:
             raise MicrosoftAuthError("No Microsoft token found. Complete /auth/login first.")
 
@@ -88,7 +88,7 @@ class MicrosoftAuthService:
         if expires_at > (now + timedelta(seconds=TOKEN_EXPIRY_BUFFER_SECONDS)):
             return token_row.access_token
 
-        refreshed = self.refresh_access_token(token_row.refresh_token)
+        refreshed = await self.refresh_access_token(token_row.refresh_token)
         token_row.access_token = refreshed.access_token
         token_row.refresh_token = refreshed.refresh_token
         token_row.expires_at = refreshed.expires_at
@@ -97,12 +97,12 @@ class MicrosoftAuthService:
         if refreshed.user_email:
             token_row.user_email = refreshed.user_email
         db.add(token_row)
-        db.commit()
-        db.refresh(token_row)
+        await db.commit()
+        await db.refresh(token_row)
         return token_row.access_token
 
-    def save_tokens(self, db: Session, payload: MicrosoftTokenPayload) -> None:
-        token_row = db.query(UserToken).filter(UserToken.user_email == payload.user_email).first()
+    async def save_tokens(self, db: AsyncSession, payload: MicrosoftTokenPayload) -> None:
+        token_row = (await db.execute(select(UserToken).where(UserToken.user_email == payload.user_email))).scalars().first()
         if token_row is None:
             token_row = UserToken(
                 provider="microsoft",
@@ -120,14 +120,15 @@ class MicrosoftAuthService:
             token_row.refresh_token = payload.refresh_token
             token_row.expires_at = payload.expires_at
         db.add(token_row)
-        db.commit()
+        await db.commit()
 
-    def _request_token(self, body: dict[str, str], require_identity_claims: bool) -> MicrosoftTokenPayload:
+    async def _request_token(self, body: dict[str, str], require_identity_claims: bool) -> MicrosoftTokenPayload:
         token_url = f"{self.authority_base}/token"
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
         try:
-            response = requests.post(token_url, headers=headers, data=body, timeout=30)
-        except RequestException as exc:
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.post(token_url, headers=headers, data=body)
+        except httpx.HTTPError as exc:
             raise MicrosoftAuthError("Failed to reach Microsoft token endpoint.") from exc
 
         if response.status_code >= 400:

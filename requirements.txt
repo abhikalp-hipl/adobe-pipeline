@@ -6,5 +6,8 @@ pydantic
 python-dotenv
 pdfservices-sdk
 requests
+httpx
+aiosqlite
+aiosmtplib
 PyPDF2
 openpyxl

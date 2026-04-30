@@ -1,11 +1,12 @@
 import logging
 import os
-import smtplib
 import ssl
 from email import encoders
 from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+
+import aiosmtplib
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +34,7 @@ def _int_from_env(name: str, default: int | None = None) -> int:
         raise EmailServiceError(f"Invalid integer value for {name}: {raw!r}") from exc
 
 
-def send_email(
+async def send_email(
     to_email: str,
     subject: str,
     html_content: str,
@@ -76,24 +77,18 @@ def send_email(
             context = ssl.create_default_context()
             if ca_file:
                 context.load_verify_locations(cafile=ca_file)
-        if use_ssl:
-            server_cm = smtplib.SMTP_SSL(smtp_host, smtp_port, context=context)
-        else:
-            server_cm = smtplib.SMTP(smtp_host, smtp_port)
-
-        with server_cm as server:
-            server.ehlo()
-            if not use_ssl:
-                if not server.has_extn("starttls"):
-                    raise EmailServiceError("SMTP server does not support STARTTLS. Set SMTP_USE_SSL=true for port 465.")
-                server.starttls(context=context)
-                server.ehlo()
-
-            if not server.has_extn("auth"):
-                raise EmailServiceError("SMTP server did not advertise AUTH; cannot log in.")
-
-            server.login(smtp_user, smtp_password)
-            server.sendmail(email_from, to_email, msg.as_string())
-    except smtplib.SMTPException as exc:
+        await aiosmtplib.send(
+            msg,
+            hostname=smtp_host,
+            port=smtp_port,
+            username=smtp_user,
+            password=smtp_password,
+            start_tls=not use_ssl,
+            use_tls=use_ssl,
+            tls_context=context,
+            sender=email_from,
+            recipients=[to_email],
+        )
+    except Exception as exc:
         logger.exception("SMTP send failed: host=%s port=%s to=%s", smtp_host, smtp_port, to_email)
         raise EmailServiceError("SMTP send failed.") from exc

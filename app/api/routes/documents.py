@@ -1,7 +1,7 @@
 import logging
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.db.database import get_db
@@ -23,9 +23,9 @@ logger = logging.getLogger(__name__)
 
 
 @router.post("/upload", response_model=DocumentResponse, status_code=status.HTTP_201_CREATED)
-def upload_document_endpoint(
+async def upload_document_endpoint(
     file: UploadFile = File(...),
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
 ) -> DocumentResponse:
     if settings.STORAGE_PROVIDER == "onedrive":
         raise HTTPException(
@@ -34,7 +34,7 @@ def upload_document_endpoint(
         )
     logger.info("Upload request received: filename=%s", file.filename)
     try:
-        document = upload_document(file=file, db=db)
+        document = await upload_document(file=file, db=db)
         logger.info("Upload completed: document_id=%s status=%s", document.id, document.status.value)
         return DocumentResponse.model_validate(document)
     except HTTPException:
@@ -48,26 +48,26 @@ def upload_document_endpoint(
 
 
 @router.get("", response_model=list[DocumentResponse])
-def list_documents_endpoint(db: Session = Depends(get_db)) -> list[DocumentResponse]:
-    documents = list_documents(db=db)
+async def list_documents_endpoint(db: AsyncSession = Depends(get_db)) -> list[DocumentResponse]:
+    documents = await list_documents(db=db)
     logger.info("List documents request completed: count=%d", len(documents))
     return [DocumentResponse.model_validate(document) for document in documents]
 
 
 @router.get("/{document_id}", response_model=DocumentResponse)
-def get_document_endpoint(
+async def get_document_endpoint(
     document_id: str,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
 ) -> DocumentResponse:
-    document = get_document_by_id(document_id=document_id, db=db)
+    document = await get_document_by_id(document_id=document_id, db=db)
     logger.info("Get document request completed: document_id=%s status=%s", document.id, document.status.value)
     return DocumentResponse.model_validate(document)
 
 
 @router.post("/{document_id}/process")
-def process_document_endpoint(
+async def process_document_endpoint(
     document_id: str,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
 ) -> dict[str, str]:
     if settings.STORAGE_PROVIDER == "onedrive":
         raise HTTPException(
@@ -77,7 +77,7 @@ def process_document_endpoint(
     logger.info("Process request received: document_id=%s", document_id)
     orchestrator = Orchestrator(db=db)
     try:
-        result = orchestrator.process_document(document_id=document_id)
+        result = await orchestrator.process_document(document_id=document_id)
         logger.info("Process request completed: document_id=%s status=%s", document_id, result["status"])
         return result
     except DocumentNotFoundError as exc:
@@ -101,7 +101,7 @@ def process_document_endpoint(
 
 
 @router.post("/onedrive/process-intake")
-def process_onedrive_intake_endpoint(
+async def process_onedrive_intake_endpoint(
 ) -> dict[str, int]:
     if settings.STORAGE_PROVIDER != "onedrive":
         raise HTTPException(
@@ -111,7 +111,7 @@ def process_onedrive_intake_endpoint(
 
     scheduler = Scheduler()
     try:
-        return scheduler.process_onedrive_intake()
+        return await scheduler.process_onedrive_intake()
     except OneDriveAuthError as exc:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

@@ -3,7 +3,7 @@ import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import JSONResponse, StreamingResponse
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.database import get_db
 from app.services.auth.microsoft_auth import MicrosoftAuthError, MicrosoftAuthService
@@ -39,14 +39,14 @@ def _resolve_folder(folder: str) -> str:
 
 
 @router.get("/files")
-def list_files(folder: str = Query(...), db: Session = Depends(get_db)) -> list[dict]:
+async def list_files(folder: str = Query(...), db: AsyncSession = Depends(get_db)) -> list[dict]:
     folder_path = _resolve_folder(folder)
     logger.info("Files API listing OneDrive folder: folder=%s mapped_path=%s", folder, folder_path)
     auth_service = MicrosoftAuthService()
     onedrive_client = OneDriveClient()
     try:
-        access_token = auth_service.get_valid_access_token(db=db)
-        files = onedrive_client.list_files(access_token=access_token, folder_path=folder_path)
+        access_token = await auth_service.get_valid_access_token(db=db)
+        files = await onedrive_client.list_files(access_token=access_token, folder_path=folder_path)
     except MicrosoftAuthError as exc:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc)) from exc
     except OneDriveNotFoundError:
@@ -71,15 +71,15 @@ def list_files(folder: str = Query(...), db: Session = Depends(get_db)) -> list[
 
 
 @router.get("/file-content")
-def get_file_content(file_id: str = Query(..., alias="id"), db: Session = Depends(get_db)):
+async def get_file_content(file_id: str = Query(..., alias="id"), db: AsyncSession = Depends(get_db)):
     auth_service = MicrosoftAuthService()
     onedrive_client = OneDriveClient()
     try:
-        access_token = auth_service.get_valid_access_token(db=db)
-        metadata = onedrive_client.get_item_metadata(access_token=access_token, file_id=file_id)
+        access_token = await auth_service.get_valid_access_token(db=db)
+        metadata = await onedrive_client.get_item_metadata(access_token=access_token, file_id=file_id)
         mime_type = metadata.get("file", {}).get("mimeType", "application/octet-stream")
         filename = metadata.get("name", "download")
-        content_response = onedrive_client.get_file_content(access_token=access_token, file_id=file_id)
+        content_content = await onedrive_client.get_file_content(access_token=access_token, file_id=file_id)
     except MicrosoftAuthError as exc:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc)) from exc
     except OneDriveNotFoundError as exc:
@@ -89,21 +89,21 @@ def get_file_content(file_id: str = Query(..., alias="id"), db: Session = Depend
 
     if filename.lower().endswith(".json") or mime_type == "application/json":
         try:
-            return JSONResponse(content=json.loads(content_response.content.decode("utf-8")))
+            return JSONResponse(content=json.loads(content_content.decode("utf-8")))
         except (ValueError, UnicodeDecodeError) as exc:
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Invalid JSON file: {exc}") from exc
 
     headers = {"Content-Disposition": f'inline; filename="{filename}"'}
-    return StreamingResponse(content_response.iter_content(chunk_size=1024 * 1024), media_type=mime_type, headers=headers)
+    return StreamingResponse(iter([content_content]), media_type=mime_type, headers=headers)
 
 
 @router.get("/file-preview-pdf")
-def get_file_preview_pdf(file_id: str = Query(..., alias="id"), db: Session = Depends(get_db)):
+async def get_file_preview_pdf(file_id: str = Query(..., alias="id"), db: AsyncSession = Depends(get_db)):
     auth_service = MicrosoftAuthService()
     onedrive_client = OneDriveClient()
     try:
-        access_token = auth_service.get_valid_access_token(db=db)
-        metadata = onedrive_client.get_item_metadata(access_token=access_token, file_id=file_id)
+        access_token = await auth_service.get_valid_access_token(db=db)
+        metadata = await onedrive_client.get_item_metadata(access_token=access_token, file_id=file_id)
         filename = metadata.get("name", "document")
         mime_type = metadata.get("file", {}).get("mimeType", "application/octet-stream")
         lower_name = filename.lower()
@@ -116,7 +116,7 @@ def get_file_preview_pdf(file_id: str = Query(..., alias="id"), db: Session = De
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Preview PDF conversion supports DOC and DOCX only.",
             )
-        pdf_response = onedrive_client.get_file_content_as_pdf(access_token=access_token, file_id=file_id)
+        pdf_content = await onedrive_client.get_file_content_as_pdf(access_token=access_token, file_id=file_id)
     except MicrosoftAuthError as exc:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc)) from exc
     except OneDriveNotFoundError as exc:
@@ -126,7 +126,7 @@ def get_file_preview_pdf(file_id: str = Query(..., alias="id"), db: Session = De
 
     preview_name = f"{filename.rsplit('.', 1)[0]}.preview.pdf" if "." in filename else "document.preview.pdf"
     return StreamingResponse(
-        pdf_response.iter_content(chunk_size=1024 * 1024),
+        iter([pdf_content]),
         media_type="application/pdf",
         headers={"Content-Disposition": f'inline; filename="{preview_name}"'},
     )

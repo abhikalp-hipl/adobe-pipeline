@@ -3,7 +3,8 @@ from uuid import uuid4
 
 from fastapi import HTTPException, UploadFile, status
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import Session
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.db.models import Document, DocumentStatus
@@ -15,7 +16,7 @@ class DocumentServiceError(Exception):
     pass
 
 
-def upload_document(file: UploadFile, db: Session) -> Document:
+async def upload_document(file: UploadFile, db: AsyncSession) -> Document:
     if settings.STORAGE_PROVIDER == "onedrive":
         raise DocumentServiceError("Local upload storage is disabled in OneDrive-only mode.")
 
@@ -34,12 +35,12 @@ def upload_document(file: UploadFile, db: Session) -> Document:
 
     try:
         with destination.open("wb") as buffer:
-            while chunk := file.file.read(1024 * 1024):
+            while chunk := await file.read(1024 * 1024):
                 buffer.write(chunk)
     except OSError as exc:
         raise DocumentServiceError("Failed to store uploaded file.") from exc
     finally:
-        file.file.close()
+        await file.close()
 
     document = Document(
         id=document_id,
@@ -49,10 +50,10 @@ def upload_document(file: UploadFile, db: Session) -> Document:
 
     try:
         db.add(document)
-        db.commit()
-        db.refresh(document)
+        await db.commit()
+        await db.refresh(document)
     except SQLAlchemyError as exc:
-        db.rollback()
+        await db.rollback()
         try:
             destination.unlink(missing_ok=True)
         except OSError:
@@ -62,12 +63,12 @@ def upload_document(file: UploadFile, db: Session) -> Document:
     return document
 
 
-def list_documents(db: Session) -> list[Document]:
-    return db.query(Document).order_by(Document.created_at.desc()).all()
+async def list_documents(db: AsyncSession) -> list[Document]:
+    return (await db.execute(select(Document).order_by(Document.created_at.desc()))).scalars().all()
 
 
-def get_document_by_id(document_id: str, db: Session) -> Document:
-    document = db.query(Document).filter(Document.id == document_id).first()
+async def get_document_by_id(document_id: str, db: AsyncSession) -> Document:
+    document = (await db.execute(select(Document).where(Document.id == document_id))).scalars().first()
     if not document:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
