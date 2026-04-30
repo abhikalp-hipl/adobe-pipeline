@@ -13,20 +13,21 @@
     "react": "^18.3.1",
     "react-clock": "^6.0.0",
     "react-dom": "^18.3.1",
-    "react-scripts": "^5.0.1",
     "react-time-picker": "^8.0.3",
     "xlsx": "^0.18.5"
   },
   "devDependencies": {
+    "@vitejs/plugin-react": "^5.0.0",
     "autoprefixer": "^10.4.21",
     "postcss": "^8.5.3",
-    "tailwindcss": "^3.4.17"
+    "tailwindcss": "^3.4.17",
+    "vite": "^7.0.0"
   },
   "scripts": {
-    "start": "react-scripts start",
-    "build": "react-scripts build",
-    "test": "react-scripts test",
-    "eject": "react-scripts eject"
+    "start": "vite",
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
   },
   "browserslist": {
     "production": [

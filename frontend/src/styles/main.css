@@ -1,7 +1,7 @@
+@import "./components.css";
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
-@import "./components.css";
 
 body {
   margin: 0;

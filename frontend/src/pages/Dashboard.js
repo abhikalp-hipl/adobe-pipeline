@@ -67,6 +67,7 @@ const EMPTY_SUMMARY = {
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const DASHBOARD_CACHE_TTL_MS = 60 * 1000;
 const RUN_FILES_CACHE_TTL_MS = 5 * 60 * 1000;
+const FOLDER_FILES_CACHE_TTL_MS = 30 * 1000;
 const DASHBOARD_CACHE_KEYS = {
   runs: "dashboard_runs_cache_v1",
   dashboardFiles: "dashboard_files_cache_v1",
@@ -278,6 +279,7 @@ function Dashboard() {
   const lastTerminalRefreshAtRef = useRef(0);
   const runFilesByRunIdRef = useRef(runFilesByRunId);
   const folderFetchRequestIdRef = useRef(0);
+  const folderFilesCacheRef = useRef({});
 
   const intervalOptions = [1, 2, 5, 10, 15, 30, 60];
   const isRunning = Boolean(pipelineStatus?.is_running);
@@ -302,20 +304,48 @@ function Dashboard() {
     }
   }, []);
 
-  const refreshSelectedFolderFiles = useCallback(async (folderKey = selectedFolderRef.current) => {
+  const refreshSelectedFolderFiles = useCallback(async (folderKey = selectedFolderRef.current, { force = false, background = false } = {}) => {
     const requestId = ++folderFetchRequestIdRef.current;
-    setIsLoadingFiles(true);
     setError("");
-    setFiles([]);
-    setSelectedFile(null);
-    setFileContent(null);
-    setXlsxContent(null);
+    if (!background) {
+      setSelectedFile(null);
+      setFileContent(null);
+      setXlsxContent(null);
+    }
+    const now = Date.now();
+    const cached = folderFilesCacheRef.current[folderKey];
+    if (!force && cached && now - cached.ts < FOLDER_FILES_CACHE_TTL_MS) {
+      setFiles(cached.files);
+      setFolderCounts((prev) => ({
+        ...prev,
+        [folderKey]: cached.files.length,
+      }));
+      setLastUpdatedAt(new Date(cached.ts).toISOString());
+      setIsLoadingFiles(false);
+      // stale-while-revalidate: keep UI responsive with cache, refresh in background
+      refreshSelectedFolderFiles(folderKey, { force: true, background: true });
+      return;
+    }
+
+    if (!background) {
+      setIsLoadingFiles(true);
+      setFiles([]);
+    }
     try {
       const response = await getFiles(folderKey);
       if (requestId !== folderFetchRequestIdRef.current || folderKey !== selectedFolderRef.current) {
         return;
       }
-      setFiles(response);
+      const normalizedFiles = Array.isArray(response) ? response : [];
+      folderFilesCacheRef.current[folderKey] = {
+        files: normalizedFiles,
+        ts: Date.now(),
+      };
+      setFiles(normalizedFiles);
+      setFolderCounts((prev) => ({
+        ...prev,
+        [folderKey]: normalizedFiles.length,
+      }));
       setLastUpdatedAt(new Date().toISOString());
     } catch (requestError) {
       if (requestId !== folderFetchRequestIdRef.current || folderKey !== selectedFolderRef.current) {
@@ -334,9 +364,8 @@ function Dashboard() {
       selectedFolderRef.current = folderKey;
       setSelectedFolder(folderKey);
       setActivePage("folder");
-      refreshSelectedFolderFiles(folderKey);
     },
-    [refreshSelectedFolderFiles]
+    []
   );
 
   useEffect(() => {
@@ -354,7 +383,7 @@ function Dashboard() {
 
   useEffect(() => {
     refreshFolderCounts();
-  }, [selectedFolder, refreshFolderCounts]);
+  }, [refreshFolderCounts]);
 
   const refreshDashboard = useCallback(async ({ full = false } = {}) => {
     setIsLoadingDashboardFiles((dashboardFiles || []).length === 0);
@@ -569,7 +598,7 @@ function Dashboard() {
           refreshDashboard();
           refreshFolderCounts();
           if (activePageRef.current === "folder") {
-            refreshSelectedFolderFiles();
+            refreshSelectedFolderFiles(selectedFolderRef.current, { force: true });
           }
         }
       }
@@ -586,7 +615,7 @@ function Dashboard() {
           refreshDashboard();
           refreshFolderCounts();
           if (activePageRef.current === "folder") {
-            refreshSelectedFolderFiles();
+            refreshSelectedFolderFiles(selectedFolderRef.current, { force: true });
           }
         }
       }

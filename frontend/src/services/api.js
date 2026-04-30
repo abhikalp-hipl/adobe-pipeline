@@ -55,8 +55,6 @@ export const getAuthStatus = async () => {
 
 export const getFiles = async (folder) => {
   const response = await api.get("/files", { params: { folder } });
-  // eslint-disable-next-line no-console
-  console.log("GET /files response", folder, response.data);
   return response.data || [];
 };
 

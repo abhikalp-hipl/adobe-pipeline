@@ -1,4 +1,5 @@
 import React from "react";
+import { isMicrosoftConfigReady } from "../config/env";
 
 function MicrosoftLogin() {
   const handleLogin = () => {
@@ -19,6 +20,11 @@ function MicrosoftLogin() {
       <p className="mt-2 text-sm text-slate-600">
         After successful login, you will be redirected back to the dashboard.
       </p>
+      {!isMicrosoftConfigReady && (
+        <p className="mt-2 text-xs text-amber-700">
+          Set VITE_MS_CLIENT_ID and VITE_MS_TENANT_ID in your .env for local configuration.
+        </p>
+      )}
     </div>
   );
 }
