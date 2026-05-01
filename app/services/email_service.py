@@ -7,6 +7,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
 import aiosmtplib
+import certifi
 
 logger = logging.getLogger(__name__)
 
@@ -73,10 +74,11 @@ async def send_email(
     try:
         if insecure_tls:
             context = ssl._create_unverified_context()  # noqa: SLF001
+        elif ca_file:
+            context = ssl.create_default_context(cafile=ca_file)
         else:
-            context = ssl.create_default_context()
-            if ca_file:
-                context.load_verify_locations(cafile=ca_file)
+            # python.org macOS builds often lack a usable default CA store; certifi fixes SMTP TLS.
+            context = ssl.create_default_context(cafile=certifi.where())
         await aiosmtplib.send(
             msg,
             hostname=smtp_host,
