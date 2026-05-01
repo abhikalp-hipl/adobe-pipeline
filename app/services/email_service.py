@@ -35,6 +35,21 @@ def _int_from_env(name: str, default: int | None = None) -> int:
         raise EmailServiceError(f"Invalid integer value for {name}: {raw!r}") from exc
 
 
+def _build_tls_context(*, ca_file: str, insecure_tls: bool) -> ssl.SSLContext:
+    if insecure_tls:
+        logger.warning("SMTP TLS certificate verification is disabled via SMTP_TLS_INSECURE.")
+        context = ssl._create_unverified_context()  # noqa: SLF001
+    elif ca_file:
+        context = ssl.create_default_context(cafile=ca_file)
+    else:
+        # certifi helps avoid macOS trust-store issues in some Python installs.
+        context = ssl.create_default_context(cafile=certifi.where())
+
+    # Enforce modern TLS for SMTP transport security.
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    return context
+
+
 async def send_email(
     to_email: str,
     subject: str,

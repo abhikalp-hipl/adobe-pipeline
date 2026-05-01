@@ -15,9 +15,12 @@ function ErrorPopup({ error, onClose, onRetry }) {
             <span className="text-gray-500">File:</span> <span className="font-medium">{error.file || "-"}</span>
           </p>
           <p className="text-sm">
-            <span className="text-gray-500">Step:</span> <span className="font-medium">{error.step || "-"}</span>
+            <span className="text-gray-500">Failed at step:</span> <span className="font-medium">{error.step || "-"}</span>
           </p>
-          <p className="text-sm text-red-500">{error.message || "Unknown error"}</p>
+          <p className="text-sm">
+            <span className="text-gray-500">Reason:</span>{" "}
+            <span className="text-red-500">{error.message || "Unknown error"}</span>
+          </p>
         </div>
 
         <div className="flex justify-end gap-2 mt-5">

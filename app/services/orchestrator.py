@@ -129,9 +129,16 @@ class Orchestrator:
         except Exception as exc:
             await self._set_status(document, DocumentStatus.FAILED)
             logger.exception("Pipeline failed: document_id=%s", document.id)
-            self._log_error(original_name=original_name, failed_step=failed_step, error=str(exc))
-            err = OrchestratorError(str(exc) or "Document processing failed.")
+            root = exc
+            while getattr(root, "__cause__", None) is not None:
+                root = root.__cause__
+            root_reason = str(root) or str(exc) or "Document processing failed."
+            error_code = AdobeClient.extract_error_code(root_reason)
+            message = error_code if error_code != "ADOBE_API_ERROR" else root_reason
+            self._log_error(original_name=original_name, failed_step=failed_step, error=message)
+            err = OrchestratorError(message)
             setattr(err, "failed_step", failed_step)
+            setattr(err, "failure_reason", message)
             setattr(err, "failed_destination", "")
             raise err from exc
 

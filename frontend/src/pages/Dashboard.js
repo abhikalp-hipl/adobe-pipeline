@@ -1319,6 +1319,7 @@ function Dashboard() {
                                         <tr>
                                           <th className="text-left p-2 border">File Name</th>
                                           <th className="text-left p-2 border">Status</th>
+                                          <th className="text-left p-2 border">Failure Reason</th>
                                           <th className="text-left p-2 border">Accessibility</th>
                                           <th className="text-left p-2 border">Outputs</th>
                                         </tr>
@@ -1341,6 +1342,15 @@ function Dashboard() {
                                                     }`}>
                                                       {file.status || "UNKNOWN"}
                                                     </span>
+                                                  </td>
+                                                  <td className="p-2 border text-xs text-red-600 max-w-[420px]">
+                                                    {file.status === "FAILED" ? (
+                                                      <span title={file?.error || "Unknown failure reason"} className="break-words">
+                                                        {file?.error || "Unknown failure reason"}
+                                                      </span>
+                                                    ) : (
+                                                      <span className="text-gray-400">-</span>
+                                                    )}
                                                   </td>
                                                   <td className="p-2 border text-gray-500">
                                                     <div className="flex gap-2 text-xs">

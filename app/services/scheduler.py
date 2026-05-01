@@ -575,7 +575,7 @@ class Scheduler:
             except OrchestratorError as exc:
                 logger.exception("Scheduler processing failed for file: filename=%s", display_filename)
                 failed_step = getattr(exc, "failed_step", "") or "unknown"
-                progress_map = {"fetch": 5, "convert_to_pdf": 30, "auto_tag": 60, "check_accessibility": 80}
+                progress_map = {"fetch": 5, "convert_to_pdf": 30, "precheck": 45, "auto_tag": 60, "check_accessibility": 80}
                 self._record_failure(
                     filename=display_filename,
                     failed_step=failed_step,
@@ -675,7 +675,7 @@ class Scheduler:
                 except OneDriveError:
                     logger.exception("Failed to move OneDrive original to failure: file_id=%s", source_id)
                 failed_step = getattr(exc, "failed_step", "") or "unknown"
-                progress_map = {"fetch": 5, "convert_to_pdf": 30, "auto_tag": 60, "check_accessibility": 80}
+                progress_map = {"fetch": 5, "convert_to_pdf": 30, "precheck": 45, "auto_tag": 60, "check_accessibility": 80}
                 self._record_failure(
                     filename=original_filename,
                     failed_step=failed_step,

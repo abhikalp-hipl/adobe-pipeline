@@ -2,6 +2,7 @@
 import asyncio
 import logging
 import os
+import re
 from pathlib import Path
 
 from adobe.pdfservices.operation.auth.service_principal_credentials import (
@@ -118,8 +119,9 @@ class AdobeClient:
             logger.info("Adobe job status: job_id=%s status=DONE", location)
             logger.info("Adobe convert_to_pdf completed: output=%s", output_path)
         except (ServiceApiException, ServiceUsageException, SdkException, OSError) as exc:
-            logger.exception("Adobe convert_to_pdf failed: input=%s", source)
-            raise AdobeAPIError("Failed to convert file to PDF.") from exc
+            code = self.extract_error_code(str(exc))
+            logger.error("Adobe convert_to_pdf failed: input=%s error_code=%s", source, code)
+            raise AdobeAPIError(code) from exc
         return output_path
 
     def auto_tag(
@@ -167,8 +169,9 @@ class AdobeClient:
             logger.info("Adobe job status: job_id=%s status=DONE", location)
             logger.info("Adobe auto_tag completed: tagged_output=%s", tagged_output_path)
         except (ServiceApiException, ServiceUsageException, SdkException, OSError) as exc:
-            logger.exception("Adobe auto_tag failed: input=%s", source)
-            raise AdobeAPIError("Failed to auto-tag PDF.") from exc
+            code = self.extract_error_code(str(exc))
+            logger.error("Adobe auto_tag failed: input=%s error_code=%s", source, code)
+            raise AdobeAPIError(code) from exc
         return tagged_output_path, report_path
 
     def check_accessibility(self, input_path: str | Path, report_dir: str | Path | None = None) -> Path:
@@ -200,8 +203,9 @@ class AdobeClient:
             logger.info("Adobe job status: job_id=%s status=DONE", location)
             logger.info("Adobe accessibility_check completed: report=%s", report_output_path)
         except (ServiceApiException, ServiceUsageException, SdkException, OSError) as exc:
-            logger.exception("Adobe accessibility_check failed: input=%s", source)
-            raise AdobeAPIError("Failed to run accessibility check.") from exc
+            code = self.extract_error_code(str(exc))
+            logger.error("Adobe accessibility_check failed: input=%s error_code=%s", source, code)
+            raise AdobeAPIError(code) from exc
         return report_output_path
 
     async def convert_to_pdf_async(self, input_path: str | Path, output_dir: str | Path | None = None) -> Path:
@@ -249,3 +253,17 @@ class AdobeClient:
             if as_dict.get(key):
                 return str(as_dict[key])
         return "unknown"
+
+    @staticmethod
+    def extract_error_code(message: str) -> str:
+        # SDK messages usually contain "errorCode=QUOTA_EXCEEDED".
+        patterns = [
+            r"errorCode=([A-Z0-9_]+)",
+            r'"errorCode"\s*:\s*"([A-Z0-9_]+)"',
+            r"'errorCode'\s*:\s*'([A-Z0-9_]+)'",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, message or "")
+            if match:
+                return match.group(1)
+        return "ADOBE_API_ERROR"
