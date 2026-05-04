@@ -596,7 +596,7 @@ class Scheduler:
                         )
                     else:
                         logger.info(
-                            "Scheduler skipping known file: filename=%s source_id=%s document_id=%s",
+                            "Skipping file because it was already processed: filename=%s source_id=%s document_id=%s. Action required: rename the file or upload a different file.",
                             display_filename,
                             source_id or "n/a",
                             existing.id,
@@ -604,7 +604,7 @@ class Scheduler:
                     return {
                         "name": display_filename,
                         "status": existing.status.value,
-                        "error": "Already processed.",
+                        "error": "This file was already processed earlier. Please rename the file or upload a different file.",
                         "report_path": "",
                     }
 
@@ -694,15 +694,15 @@ class Scheduler:
                 existing = (await db.execute(select(Document).where(Document.filename == source_id))).scalars().first()
                 if existing:
                     logger.info(
-                        "Skipping already processed OneDrive file: source_id=%s filename=%s document_id=%s",
-                        source_id,
+                        "Skipping file because it was already processed: filename=%s source_id=%s document_id=%s. Action required: rename the file or upload a different file.",
                         original_filename,
+                        source_id,
                         existing.id,
                     )
                     return {
                         "name": original_filename,
                         "status": existing.status.value,
-                        "error": "Already processed.",
+                        "error": "This file was already processed earlier. Please rename the file or upload a different file.",
                         "report_path": "",
                     }
 
