@@ -949,8 +949,10 @@ class Scheduler:
                 ).scalars().all()
                 total_runs = len(runs)
                 total_files = sum(int(item.total_files or 0) for item in runs)
-                total_success = sum(int(item.success_count or 0) for item in runs)
-                total_failure = sum(int(item.failure_count or 0) for item in runs)
+                total_success_files = sum(int(item.success_count or 0) for item in runs)
+                total_failed_files = sum(int(item.failure_count or 0) for item in runs)
+                total_success_runs = sum(1 for item in runs if item.status == PipelineRunStatus.COMPLETED)
+                total_failed_runs = sum(1 for item in runs if item.status == PipelineRunStatus.FAILED)
 
                 run_rows = [
                     {
@@ -963,6 +965,32 @@ class Scheduler:
                         "status": item.status.value,
                     }
                     for item in runs
+                ]
+
+                file_rows_result = (
+                    await db.execute(
+                        select(PipelineRun.run_id, PipelineRunFile)
+                        .join(PipelineRun, PipelineRun.id == PipelineRunFile.run_id)
+                        .where(
+                            PipelineRun.created_at >= day_start,
+                            PipelineRun.created_at < day_end,
+                        )
+                        .order_by(PipelineRun.start_time.asc(), PipelineRunFile.created_at.asc())
+                    )
+                ).all()
+                file_rows = [
+                    {
+                        "run_id": run_id,
+                        "file_name": item.file_name,
+                        "status": item.status.value,
+                        "error_message": item.error_message,
+                        "output_stem": item.output_stem or "",
+                        "accessibility_passed": int(item.accessibility_passed or 0),
+                        "accessibility_failed": int(item.accessibility_failed or 0),
+                        "accessibility_manual": int(item.accessibility_manual or 0),
+                        "created_at": item.created_at,
+                    }
+                    for run_id, item in file_rows_result
                 ]
 
                 failure_messages = (
@@ -986,7 +1014,14 @@ class Scheduler:
                 payload = {
                     "date": today,
                     "runs": run_rows,
-                    "totals": {"runs": total_runs, "files": total_files, "success": total_success, "failure": total_failure},
+                    "totals": {
+                        "runs": total_runs,
+                        "files": total_files,
+                        "success_runs": total_success_runs,
+                        "failed_runs": total_failed_runs,
+                        "success_files": total_success_files,
+                        "failed_files": total_failed_files,
+                    },
                     "common_error": common_error,
                 }
                 subject = f"📊 Daily Pipeline Summary | {today.isoformat()}"
@@ -995,11 +1030,14 @@ class Scheduler:
                 attachment_bytes = self._build_eod_summary_xlsx(
                     report_date=today,
                     runs=run_rows,
+                    files=file_rows,
                     totals={
                         "runs": total_runs,
                         "files": total_files,
-                        "success": total_success,
-                        "failure": total_failure,
+                        "success_runs": total_success_runs,
+                        "failed_runs": total_failed_runs,
+                        "success_files": total_success_files,
+                        "failed_files": total_failed_files,
                     },
                 )
                 recipients = await self._get_notification_emails()
@@ -1035,6 +1073,7 @@ class Scheduler:
     def _build_eod_summary_xlsx(
         report_date: date,
         runs: list[dict[str, object]],
+        files: list[dict[str, object]],
         totals: dict[str, int],
     ) -> bytes:
         workbook = Workbook()
@@ -1056,6 +1095,40 @@ class Scheduler:
                     int(run.get("success_count") or 0),
                     int(run.get("failure_count") or 0),
                     str(run.get("status") or ""),
+                ]
+            )
+
+        files_sheet = workbook.create_sheet("Files")
+        files_sheet.append(
+            [
+                "Run ID",
+                "File Name",
+                "Status",
+                "Error Message",
+                "Output Stem",
+                "Accessibility Passed",
+                "Accessibility Failed",
+                "Accessibility Manual",
+                "Created At",
+            ]
+        )
+        for item in files:
+            created_at_raw = item.get("created_at")
+            if isinstance(created_at_raw, datetime):
+                created_at_value = created_at_raw.isoformat()
+            else:
+                created_at_value = str(created_at_raw or "")
+            files_sheet.append(
+                [
+                    str(item.get("run_id") or ""),
+                    str(item.get("file_name") or ""),
+                    str(item.get("status") or ""),
+                    str(item.get("error_message") or ""),
+                    str(item.get("output_stem") or ""),
+                    int(item.get("accessibility_passed") or 0),
+                    int(item.get("accessibility_failed") or 0),
+                    int(item.get("accessibility_manual") or 0),
+                    created_at_value,
                 ]
             )
 

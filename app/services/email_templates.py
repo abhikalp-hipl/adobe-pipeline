@@ -128,9 +128,11 @@ def build_eod_summary_email(data: dict[str, Any]) -> str:
     <hr/>
     <h3>Overall</h3>
     <p>Total Runs: {esc(totals.get('runs', 0))}</p>
+    <p style="color:green;">Successful Runs: {esc(totals.get('success_runs', 0))}</p>
+    <p style="color:red;">Failed Runs: {esc(totals.get('failed_runs', 0))}</p>
     <p>Total Files: {esc(totals.get('files', 0))}</p>
-    <p style="color:green;">Successful: {esc(totals.get('success', 0))}</p>
-    <p style="color:red;">Failed: {esc(totals.get('failure', 0))}</p>
+    <p style="color:green;">Successful Files: {esc(totals.get('success_files', 0))}</p>
+    <p style="color:red;">Failed Files: {esc(totals.get('failed_files', 0))}</p>
     <hr/>
     <h3>Run-wise Summary</h3>
     <table style="width:100%;border-collapse:collapse;">
