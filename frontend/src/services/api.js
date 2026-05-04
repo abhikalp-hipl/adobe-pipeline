@@ -38,11 +38,6 @@ export const runNow = async () => {
   return response.data;
 };
 
-export const getPipelineStatus = async () => {
-  const response = await api.get("/pipeline/status");
-  return response.data;
-};
-
 export const processOneDriveIntake = async () => {
   const response = await api.post("/documents/onedrive/process-intake");
   return response.data;

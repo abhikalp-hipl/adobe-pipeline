@@ -13,7 +13,6 @@ import {
 } from "lucide-react";
 
 import ExcelViewer from "../components/ExcelViewer";
-import ErrorPopup from "../components/ErrorPopup";
 import FileTable from "../components/FileTable";
 import DailyReportModal from "../components/DailyReportModal";
 import EmailModal from "../components/EmailModal";
@@ -34,7 +33,6 @@ import {
   getSettings,
   getFileUrl,
   getScheduler,
-  getPipelineStatus,
   runNow,
   saveSettings,
   normalizeRunFiles,
@@ -229,7 +227,6 @@ function Dashboard() {
   const [unit, setUnit] = useState("minutes");
   const [isCustom, setIsCustom] = useState(false);
   const [isSavingSchedule, setIsSavingSchedule] = useState(false);
-  const [pipelineStatus, setPipelineStatus] = useState(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [lastUpdatedAt, setLastUpdatedAt] = useState(null);
   const [lastDashboardUpdatedAt, setLastDashboardUpdatedAt] = useState(
@@ -242,8 +239,6 @@ function Dashboard() {
     "output/failure": 0,
   });
   const [showProfileMenu, setShowProfileMenu] = useState(false);
-  const [pipelineError, setPipelineError] = useState(null);
-  const lastPipelineErrorKeyRef = useRef("");
   const [success, setSuccess] = useState(null);
   const [emails, setEmails] = useState([]);
   const [emailInput, setEmailInput] = useState("");
@@ -274,11 +269,8 @@ function Dashboard() {
   const [viewerJson, setViewerJson] = useState(null);
   const [viewerXlsx, setViewerXlsx] = useState(null);
   const [isViewerLoading, setIsViewerLoading] = useState(false);
-  const lastSuccessKeyRef = useRef("");
-  const wasRunningRef = useRef(false);
   const activePageRef = useRef(activePage);
   const selectedFolderRef = useRef(selectedFolder);
-  const lastTerminalRefreshAtRef = useRef(0);
   const runFilesByRunIdRef = useRef(runFilesByRunId);
   const folderFetchRequestIdRef = useRef(0);
   const folderFilesCacheRef = useRef(
@@ -286,8 +278,7 @@ function Dashboard() {
   );
 
   const intervalOptions = [1, 2, 5, 10, 15, 30, 60];
-  const isRunning = Boolean(pipelineStatus?.is_running);
-  const showRunningState = isRunning || isRunNowPending;
+  const showRunningState = isRunNowPending;
 
   const refreshFolderCounts = useCallback(async () => {
     try {
@@ -607,121 +598,6 @@ function Dashboard() {
   }, []);
 
   useEffect(() => {
-    let isMounted = true;
-    let ws;
-    let reconnectTimer;
-
-    const applyStatus = (data) => {
-      if (!isMounted || !data) {
-        return;
-      }
-      const prevWasRunning = wasRunningRef.current;
-      const nextIsRunning = Boolean(data?.is_running);
-      setPipelineStatus(data);
-      wasRunningRef.current = nextIsRunning;
-      if (nextIsRunning || data?.current_step === "COMPLETED" || data?.current_step === "FAILED") {
-        setIsRunNowPending(false);
-      }
-
-      if (data?.current_step === "FAILED") {
-        const key = `${data?.current_file || ""}|${data?.failed_step || ""}|${data?.error || ""}`;
-        if (key && key !== lastPipelineErrorKeyRef.current) {
-          lastPipelineErrorKeyRef.current = key;
-          setPipelineError({
-            message: data?.error || "Pipeline failed.",
-            file: data?.current_file || "",
-            step: data?.failed_step || "",
-          });
-        }
-      }
-
-      if (prevWasRunning && !nextIsRunning && data?.current_step === "COMPLETED") {
-        const key = `${data?.current_file || ""}|${data?.progress || 100}`;
-        if (key && key !== lastSuccessKeyRef.current) {
-          lastSuccessKeyRef.current = key;
-          setSuccess({ file: data?.current_file || "" });
-          refreshDashboard();
-          refreshFolderCounts();
-          if (activePageRef.current === "folder") {
-            refreshSelectedFolderFiles(selectedFolderRef.current, { force: true });
-          }
-        }
-      }
-
-      if (prevWasRunning && !nextIsRunning && data?.current_step === "FAILED") {
-        refreshDashboard();
-        refreshFolderCounts();
-      }
-
-      if (!nextIsRunning && (data?.current_step === "COMPLETED" || data?.current_step === "FAILED")) {
-        const now = Date.now();
-        if (now - lastTerminalRefreshAtRef.current > 1500) {
-          lastTerminalRefreshAtRef.current = now;
-          refreshDashboard();
-          refreshFolderCounts();
-          if (activePageRef.current === "folder") {
-            refreshSelectedFolderFiles(selectedFolderRef.current, { force: true });
-          }
-        }
-      }
-    };
-
-    const connectWebSocket = () => {
-      const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-      ws = new WebSocket(`${protocol}://localhost:8000/ws/pipeline`);
-
-      ws.onopen = async () => {
-        // eslint-disable-next-line no-console
-        console.log("Connected to pipeline WebSocket");
-        try {
-          const initial = await getPipelineStatus();
-          applyStatus(initial);
-        } catch {
-          // ignore initial fetch errors
-        }
-      };
-
-      ws.onmessage = (event) => {
-        try {
-          const payload = JSON.parse(event.data);
-          if (payload?.type === "status") {
-            applyStatus(payload);
-            return;
-          }
-          if (payload?.type === "progress") {
-            applyStatus({
-              is_running: true,
-              current_file: payload?.file || "",
-              progress: Number(payload?.progress || 0),
-              current_step: payload?.current_step || "RUNNING",
-            });
-          }
-        } catch {
-          // ignore malformed messages
-        }
-      };
-
-      ws.onclose = () => {
-        if (!isMounted) {
-          return;
-        }
-        reconnectTimer = window.setTimeout(connectWebSocket, 2000);
-      };
-    };
-
-    connectWebSocket();
-    return () => {
-      isMounted = false;
-      if (reconnectTimer) {
-        window.clearTimeout(reconnectTimer);
-      }
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.close();
-      }
-    };
-  }, [refreshDashboard, refreshFolderCounts, refreshSelectedFolderFiles]);
-
-  useEffect(() => {
     let cancelled = false;
     if (!showModal) {
       return () => {
@@ -848,14 +724,16 @@ function Dashboard() {
     setIsRunNowPending(true);
     try {
       await runNow();
-      const latest = await getPipelineStatus();
-      setPipelineStatus(latest);
-      if (!latest?.is_running) {
-        setIsRunNowPending(false);
+      setSuccess({ file: "" });
+      refreshDashboard();
+      refreshFolderCounts();
+      if (activePageRef.current === "folder") {
+        refreshSelectedFolderFiles(selectedFolderRef.current, { force: true });
       }
     } catch (requestError) {
-      setIsRunNowPending(false);
       setError(requestError?.response?.data?.detail || "Failed to start processing.");
+    } finally {
+      setIsRunNowPending(false);
     }
   };
 
@@ -1885,15 +1763,6 @@ function Dashboard() {
         }}
         isSaving={isSavingSettings}
         isLoadingSettings={isLoadingReportSettings}
-      />
-
-      <ErrorPopup
-        error={pipelineError}
-        onClose={() => setPipelineError(null)}
-        onRetry={() => {
-          setPipelineError(null);
-          handleRunNow();
-        }}
       />
 
       {success && <SuccessToast success={success} onDismiss={() => setSuccess(null)} />}

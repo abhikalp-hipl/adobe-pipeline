@@ -1,5 +1,4 @@
 import logging
-import asyncio
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,7 +16,6 @@ from app.api.routes.settings import router as settings_router
 from app.db.database import Base, engine
 from app.db.database import SessionLocal
 from app.db.models import NotificationSettings
-from app.services.pipeline_ws import PipelineWebSocketManager
 from app.services.scheduler import Scheduler
 
 app = FastAPI(title="Document Processing Backend", version="1.0.0")
@@ -42,13 +40,8 @@ async def on_startup() -> None:
     await _ensure_user_token_columns()
     await _ensure_notification_settings_columns()
     await _ensure_pipeline_run_file_columns()
-    ws_manager = PipelineWebSocketManager()
-    app.state.pipeline_ws_manager = ws_manager
     scheduler_interval = await _get_persisted_scheduler_interval_seconds()
-    app.state.scheduler = Scheduler(
-        interval=scheduler_interval,
-        status_listener=lambda payload: asyncio.create_task(ws_manager.broadcast({"type": "status", **payload}))
-    )
+    app.state.scheduler = Scheduler(interval=scheduler_interval)
     app.state.scheduler.start()
 
 
