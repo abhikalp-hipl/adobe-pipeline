@@ -1,6 +1,6 @@
 import logging
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -102,6 +102,7 @@ async def process_document_endpoint(
 
 @router.post("/onedrive/process-intake")
 async def process_onedrive_intake_endpoint(
+    request: Request,
 ) -> dict[str, int]:
     if settings.STORAGE_PROVIDER != "onedrive":
         raise HTTPException(
@@ -109,7 +110,9 @@ async def process_onedrive_intake_endpoint(
             detail="OneDrive intake processing is only available when STORAGE_PROVIDER=onedrive.",
         )
 
-    scheduler = Scheduler()
+    scheduler = getattr(request.app.state, "scheduler", None)
+    if not scheduler:
+        scheduler = Scheduler()
     try:
         return await scheduler.process_onedrive_intake()
     except OneDriveAuthError as exc:
