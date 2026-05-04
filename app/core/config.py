@@ -29,6 +29,7 @@ def _int_from_env(name: str, default: int) -> int:
 class Settings:
     SCHEDULER_INTERVAL_SECONDS: int = _int_from_env("SCHEDULER_INTERVAL_SECONDS", 300)
     MAX_FILES_PER_CYCLE: int = _int_from_env("MAX_FILES_PER_CYCLE", 2)
+    MAX_CYCLES_PER_RUN: int = _int_from_env("MAX_CYCLES_PER_RUN", 20)
     PROCESSING_DELAY_SECONDS: int = _int_from_env("PROCESSING_DELAY_SECONDS", 5)
     STORAGE_PROVIDER: str = _str_from_env("STORAGE_PROVIDER", "local").lower()
     MS_CLIENT_ID: str = _str_from_env("MS_CLIENT_ID", "")

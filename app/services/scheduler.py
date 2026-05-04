@@ -63,6 +63,7 @@ class Scheduler:
         configured_interval = interval or settings.SCHEDULER_INTERVAL_SECONDS
         self.interval = max(1, configured_interval)
         self.max_files_per_cycle = max(1, settings.MAX_FILES_PER_CYCLE)
+        self.max_cycles_per_run = max(1, settings.MAX_CYCLES_PER_RUN)
         self.processing_delay_seconds = max(0, settings.PROCESSING_DELAY_SECONDS)
         self.storage_provider = settings.STORAGE_PROVIDER
         self.automation_enabled = True
@@ -190,21 +191,21 @@ class Scheduler:
         access_passed = 0
         access_failed = 0
         access_manual = 0
+        total_processed = 0
+        total_failed = 0
+        total_skipped = 0
         run_failed = False
 
         try:
-            if self.storage_provider == "onedrive":
-                run_result = await self.process_onedrive_intake()
-                files_summary = run_result.get("files", [])
-                access = run_result.get("accessibility", {})
-                access_passed = int(access.get("passed", 0))
-                access_failed = int(access.get("failed", 0))
-                access_manual = int(access.get("manual", 0))
-            else:
-                raise RuntimeError(
-                    f"Unsupported storage provider '{self.storage_provider}'. "
-                    "This deployment requires STORAGE_PROVIDER=onedrive."
-                )
+            run_result = await self._drain_intake_for_run()
+            files_summary = run_result.get("files", [])
+            access = run_result.get("accessibility", {})
+            access_passed = int(access.get("passed", 0))
+            access_failed = int(access.get("failed", 0))
+            access_manual = int(access.get("manual", 0))
+            total_processed = int(run_result.get("processed", 0))
+            total_failed = int(run_result.get("failed", 0))
+            total_skipped = int(run_result.get("skipped", 0))
         except Exception:
             run_failed = True
             raise
@@ -234,6 +235,9 @@ class Scheduler:
                 "total_files": total_files,
                 "success_count": success_count,
                 "failure_count": failure_count,
+                "total_processed": total_processed,
+                "total_failed": total_failed,
+                "total_skipped": total_skipped,
                 "files": files_summary,
                 "passed": access_passed,
                 "failed": access_failed,
@@ -313,6 +317,9 @@ class Scheduler:
             self.max_files_per_cycle,
         )
 
+        processed_count = 0
+        skipped_count = len(candidate_files) - len(process_batch)
+        failed_count = 0
         files_summary: list[dict[str, object]] = []
         access_passed = 0
         access_failed = 0
@@ -326,12 +333,16 @@ class Scheduler:
             )
             result = self._register_and_trigger(file_path=file_path, source_id=None)
             if result:
+                processed_count += 1
                 rp = str(result.get("report_path") or "")
                 summary = result.get("accessibility") or {"passed": 0, "failed": 0, "manual": 0}
+                status = str(result.get("status", ""))
+                if status == DocumentStatus.FAILED.value:
+                    failed_count += 1
                 files_summary.append(
                     {
                         "name": result.get("name", ""),
-                        "status": result.get("status", ""),
+                        "status": status,
                         "error": result.get("error", ""),
                         "output_stem": Scheduler._output_stem_from_report_path(rp),
                         "accessibility": summary,
@@ -340,11 +351,83 @@ class Scheduler:
                 access_passed += int(summary.get("passed", 0))
                 access_failed += int(summary.get("failed", 0))
                 access_manual += int(summary.get("manual", 0))
+            else:
+                skipped_count += 1
             if index < len(process_batch) - 1 and self.processing_delay_seconds > 0:
                 self._stop_event.wait(self.processing_delay_seconds)
 
         return {
+            "processed": processed_count,
+            "skipped": skipped_count,
+            "failed": failed_count,
             "files": files_summary,
+            "accessibility": {"passed": access_passed, "failed": access_failed, "manual": access_manual},
+        }
+
+    async def _drain_intake_for_run(self) -> dict[str, object]:
+        files_summary: list[dict[str, object]] = []
+        total_processed = 0
+        total_failed = 0
+        total_skipped = 0
+        access_passed = 0
+        access_failed = 0
+        access_manual = 0
+        cycle_number = 0
+
+        while cycle_number < self.max_cycles_per_run:
+            cycle_number += 1
+            if self.storage_provider == "onedrive":
+                cycle_result = await self.process_onedrive_intake()
+            elif self.storage_provider == "local":
+                cycle_result = self._poll_local_intake_folder()
+            else:
+                raise RuntimeError(
+                    f"Unsupported storage provider '{self.storage_provider}'. "
+                    "Expected one of: onedrive, local."
+                )
+
+            processed_this_cycle = int(cycle_result.get("processed", 0))
+            failed_this_cycle = int(cycle_result.get("failed", 0))
+            skipped_this_cycle = int(cycle_result.get("skipped", 0))
+            cycle_access = cycle_result.get("accessibility", {})
+
+            total_processed += processed_this_cycle
+            total_failed += failed_this_cycle
+            total_skipped += skipped_this_cycle
+            access_passed += int(cycle_access.get("passed", 0))
+            access_failed += int(cycle_access.get("failed", 0))
+            access_manual += int(cycle_access.get("manual", 0))
+            files_summary.extend(cycle_result.get("files", []))
+
+            if processed_this_cycle == 0:
+                logger.info(
+                    "Scheduler drain cycle stopped: cycle=%d processed_this_cycle=%d reason=no_files_processed",
+                    cycle_number,
+                    processed_this_cycle,
+                )
+                break
+
+            logger.info(
+                "Scheduler drain cycle complete: cycle=%d processed_this_cycle=%d",
+                cycle_number,
+                processed_this_cycle,
+            )
+
+            if cycle_number >= self.max_cycles_per_run:
+                logger.info(
+                    "Scheduler drain cycle stopped: cycle=%d processed_this_cycle=%d reason=max_cycles_reached max_cycles_per_run=%d",
+                    cycle_number,
+                    processed_this_cycle,
+                    self.max_cycles_per_run,
+                )
+                break
+
+        return {
+            "files": files_summary,
+            "processed": total_processed,
+            "failed": total_failed,
+            "skipped": total_skipped,
+            "cycle_count": cycle_number,
             "accessibility": {"passed": access_passed, "failed": access_failed, "manual": access_manual},
         }
 
