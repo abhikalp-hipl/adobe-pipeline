@@ -170,11 +170,17 @@ class Orchestrator:
 
     @staticmethod
     def _derive_original_name(stored_name: str, fallback_name: str) -> str:
-        candidate = Path(stored_name).name or Path(fallback_name).name
-        parts = candidate.split("_", 1)
-        if len(parts) == 2 and len(parts[0]) >= 8:
-            return parts[1]
-        return candidate
+        # Prefer fallback_name first because OneDrive flow stores source_id in
+        # stored_name, while fallback_name is typically "<source_id>_<filename>".
+        candidates = [Path(fallback_name).name, Path(stored_name).name]
+        for candidate in candidates:
+            if not candidate:
+                continue
+            parts = candidate.split("_", 1)
+            if len(parts) == 2 and len(parts[0]) >= 8:
+                return parts[1]
+            return candidate
+        return ""
 
     @staticmethod
     def _log_error(original_name: str, failed_step: str, error: str) -> None:
