@@ -11,7 +11,9 @@ function normalizeCell(value) {
 
 function ExcelViewer({ data }) {
   const [isParsing, setIsParsing] = useState(false);
-  const [sheetName, setSheetName] = useState("");
+  const [workbook, setWorkbook] = useState(null);
+  const [sheetNames, setSheetNames] = useState([]);
+  const [selectedSheet, setSelectedSheet] = useState("");
   const [rows, setRows] = useState([]);
   const [error, setError] = useState("");
 
@@ -19,27 +21,30 @@ function ExcelViewer({ data }) {
     let cancelled = false;
     const parse = async () => {
       if (!data) {
+        setWorkbook(null);
+        setSheetNames([]);
+        setSelectedSheet("");
         setRows([]);
-        setSheetName("");
         setError("");
         return;
       }
       setIsParsing(true);
       setError("");
       try {
-        const workbook = XLSX.read(data, { type: "array" });
-        const firstSheetName = workbook?.SheetNames?.[0] || "";
-        const sheet = firstSheetName ? workbook.Sheets[firstSheetName] : null;
-        const jsonData = sheet ? XLSX.utils.sheet_to_json(sheet, { header: 1 }) : [];
+        const parsedWorkbook = XLSX.read(data, { type: "array" });
+        const allSheetNames = Array.isArray(parsedWorkbook?.SheetNames) ? parsedWorkbook.SheetNames : [];
         if (!cancelled) {
-          setSheetName(firstSheetName);
-          setRows(Array.isArray(jsonData) ? jsonData : []);
+          setWorkbook(parsedWorkbook);
+          setSheetNames(allSheetNames);
+          setSelectedSheet((current) => (current && allSheetNames.includes(current) ? current : allSheetNames[0] || ""));
         }
       } catch (e) {
         if (!cancelled) {
+          setWorkbook(null);
+          setSheetNames([]);
+          setSelectedSheet("");
           setError("Failed to parse XLSX file.");
           setRows([]);
-          setSheetName("");
         }
       } finally {
         if (!cancelled) {
@@ -52,6 +57,16 @@ function ExcelViewer({ data }) {
       cancelled = true;
     };
   }, [data]);
+
+  useEffect(() => {
+    if (!workbook || !selectedSheet) {
+      setRows([]);
+      return;
+    }
+    const sheet = workbook.Sheets?.[selectedSheet] || null;
+    const jsonData = sheet ? XLSX.utils.sheet_to_json(sheet, { header: 1 }) : [];
+    setRows(Array.isArray(jsonData) ? jsonData : []);
+  }, [workbook, selectedSheet]);
 
   const normalizedRows = useMemo(() => {
     if (!Array.isArray(rows) || rows.length === 0) {
@@ -67,11 +82,20 @@ function ExcelViewer({ data }) {
   return (
     <div className="bg-white shadow rounded-xl p-4 overflow-auto max-h-[80vh] border">
       <div className="flex items-center justify-between mb-3">
-        <div className="text-sm text-slate-700">
-          {sheetName ? (
-            <>
-              Sheet: <span className="font-semibold">{sheetName}</span>
-            </>
+        <div className="flex items-center gap-2 text-sm text-slate-700">
+          <span>Sheet:</span>
+          {sheetNames.length > 0 ? (
+            <select
+              className="border rounded px-2 py-1 text-sm bg-white"
+              value={selectedSheet}
+              onChange={(event) => setSelectedSheet(event.target.value)}
+            >
+              {sheetNames.map((name) => (
+                <option key={name} value={name}>
+                  {name}
+                </option>
+              ))}
+            </select>
           ) : (
             <span className="text-slate-500">No sheet found</span>
           )}
