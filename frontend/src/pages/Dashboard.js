@@ -32,6 +32,7 @@ import {
   getRuns,
   getSettings,
   getFileUrl,
+  getAccessibilityDetail,
   getScheduler,
   runNow,
   saveSettings,
@@ -141,6 +142,72 @@ function normalizeReportEntry(entry) {
     status: typeof status === "string" ? status : String(status ?? ""),
     description: typeof description === "string" ? description : String(description ?? ""),
   };
+}
+
+/** OneDrive file id for tagged PDF in the same folder listing, or "". */
+function findCompanionTaggedPdfId(jsonFileName, fileList) {
+  if (!jsonFileName || typeof jsonFileName !== "string" || !Array.isArray(fileList)) {
+    return "";
+  }
+  const lower = jsonFileName.toLowerCase();
+  let stem = "";
+  if (lower.endsWith("_accessibility_report.json")) {
+    stem = jsonFileName.slice(0, -"_accessibility_report.json".length);
+  } else if (lower.endsWith("_report.json")) {
+    stem = jsonFileName.slice(0, -"_report.json".length);
+  } else if (lower.endsWith(".accessibility-report.json")) {
+    stem = jsonFileName.slice(0, -".accessibility-report.json".length);
+  } else if (lower.endsWith(".json")) {
+    stem = jsonFileName.slice(0, -".json".length);
+  }
+  if (!stem) {
+    return "";
+  }
+  const candidates = [`${stem}_tagged_pdf.pdf`, `${stem}_tagged.pdf`, `${stem}.tagged.pdf`];
+  for (const cand of candidates) {
+    const hit = fileList.find((f) => (f?.name || "").toLowerCase() === cand.toLowerCase());
+    if (hit?.id) {
+      return String(hit.id);
+    }
+  }
+  return "";
+}
+
+function buildAccessibilityLocationHints(data) {
+  if (!data || typeof data !== "object") {
+    return { pagesByKey: new Map(), unlocatable: new Set() };
+  }
+  const pageBuckets = new Map();
+  for (const [pageStr, failures] of Object.entries(data.failures_by_page || {})) {
+    const pageNum = Number(pageStr);
+    if (!Number.isFinite(pageNum)) {
+      continue;
+    }
+    if (!Array.isArray(failures)) {
+      continue;
+    }
+    for (const f of failures) {
+      const cat = f?.category ?? f?.Category ?? "";
+      const rule = f?.rule ?? f?.Rule ?? "";
+      const key = `${cat}|${rule}`;
+      if (!pageBuckets.has(key)) {
+        pageBuckets.set(key, new Set());
+      }
+      pageBuckets.get(key).add(pageNum);
+    }
+  }
+  const pagesByKey = new Map();
+  for (const [key, set] of pageBuckets.entries()) {
+    pagesByKey.set(key, [...set].sort((a, b) => a - b));
+  }
+  const unlocatable = new Set(
+    (Array.isArray(data.unlocatable_failures) ? data.unlocatable_failures : []).map((f) => {
+      const cat = f?.category ?? f?.Category ?? "";
+      const rule = f?.rule ?? f?.Rule ?? "";
+      return `${cat}|${rule}`;
+    })
+  );
+  return { pagesByKey, unlocatable };
 }
 
 function formatBytes(bytes) {
@@ -269,6 +336,10 @@ function Dashboard() {
   const [viewerJson, setViewerJson] = useState(null);
   const [viewerXlsx, setViewerXlsx] = useState(null);
   const [isViewerLoading, setIsViewerLoading] = useState(false);
+  const [accessibilityDetail, setAccessibilityDetail] = useState(null);
+  const [isLoadingAccessibilityDetail, setIsLoadingAccessibilityDetail] = useState(false);
+  const [folderAccessibilityDetail, setFolderAccessibilityDetail] = useState(null);
+  const [isLoadingFolderAccessibilityDetail, setIsLoadingFolderAccessibilityDetail] = useState(false);
   const activePageRef = useRef(activePage);
   const selectedFolderRef = useRef(selectedFolder);
   const runFilesByRunIdRef = useRef(runFilesByRunId);
@@ -690,6 +761,8 @@ function Dashboard() {
     }
     setIsLoadingContent(true);
     setError("");
+    setFolderAccessibilityDetail(null);
+    setIsLoadingFolderAccessibilityDetail(false);
     try {
       const content = await getFileContent(file.id);
       setFileContent(content);
@@ -708,6 +781,8 @@ function Dashboard() {
     setXlsxContent(null);
     setIsOpeningFile(false);
     setDocPreviewUrl("");
+    setFolderAccessibilityDetail(null);
+    setIsLoadingFolderAccessibilityDetail(false);
   };
 
   const intervalSeconds =
@@ -837,30 +912,64 @@ function Dashboard() {
     }
   };
 
-  const openFile = async (type, url, title) => {
+  const openFile = async (type, url, title, options = {}) => {
+    const { companionPdfUrl } = options;
     const resolvedUrl = url && url.startsWith("http") ? url : `http://localhost:8000${url || ""}`;
-    setViewer({ type, url: resolvedUrl, title: title || "" });
+    let companionPdfId = "";
+    if (companionPdfUrl) {
+      try {
+        const companionResolved =
+          companionPdfUrl && companionPdfUrl.startsWith("http")
+            ? companionPdfUrl
+            : `http://localhost:8000${companionPdfUrl || ""}`;
+        const companionParsed = new URL(companionResolved, window.location.origin);
+        companionPdfId = companionParsed.searchParams.get("id") || "";
+      } catch {
+        companionPdfId = "";
+      }
+    }
+    setAccessibilityDetail(null);
+    setIsLoadingAccessibilityDetail(false);
     setViewerJson(null);
     setViewerXlsx(null);
     if (!url) {
+      setViewer(null);
       setIsViewerLoading(false);
       return;
     }
+    let fileId = "";
+    try {
+      const parsed = new URL(resolvedUrl, window.location.origin);
+      fileId = parsed.searchParams.get("id") || "";
+    } catch {
+      setError("Failed to open output file.");
+      setIsViewerLoading(false);
+      return;
+    }
+    if (!fileId) {
+      setError("Failed to open output file.");
+      setIsViewerLoading(false);
+      return;
+    }
+    const pdfIdForViewer = type === "pdf" ? fileId : companionPdfId;
+    const jsonIdForViewer = type === "json" ? fileId : "";
+    setViewer({
+      type,
+      url: resolvedUrl,
+      title: title || "",
+      pdfId: pdfIdForViewer,
+      jsonId: jsonIdForViewer,
+    });
     setIsViewerLoading(true);
     if (type === "pdf") {
       return;
     }
     try {
-      const parsed = new URL(resolvedUrl, window.location.origin);
-      const id = parsed.searchParams.get("id");
-      if (!id) {
-        throw new Error("Missing file id.");
-      }
       if (type === "json") {
-        const content = await getFileContent(id);
+        const content = await getFileContent(fileId);
         setViewerJson(content);
       } else if (type === "xlsx") {
-        const buffer = await getFileContentArrayBuffer(id);
+        const buffer = await getFileContentArrayBuffer(fileId);
         setViewerXlsx(buffer);
       }
     } catch {
@@ -875,6 +984,8 @@ function Dashboard() {
     setViewerJson(null);
     setViewerXlsx(null);
     setIsViewerLoading(false);
+    setAccessibilityDetail(null);
+    setIsLoadingAccessibilityDetail(false);
   };
 
   const handleRunRowClick = async (runId) => {
@@ -984,6 +1095,13 @@ function Dashboard() {
     return Object.entries(detailed).filter(([, value]) => Array.isArray(value));
   }, [fileContent]);
 
+  const folderJsonCompanionPdfId = useMemo(() => {
+    if (!isViewerOpen || !isJsonSelected || !selectedFile?.name) {
+      return "";
+    }
+    return findCompanionTaggedPdfId(selectedFile.name, files);
+  }, [isViewerOpen, isJsonSelected, selectedFile?.name, files]);
+
   const viewerSummary = useMemo(() => {
     if (!viewerJson || typeof viewerJson !== "object" || Array.isArray(viewerJson)) {
       return EMPTY_SUMMARY;
@@ -1013,6 +1131,85 @@ function Dashboard() {
     }
     return Object.entries(detailed).filter(([, value]) => Array.isArray(value));
   }, [viewerJson]);
+
+  const accessibilityLocationHints = useMemo(
+    () => buildAccessibilityLocationHints(accessibilityDetail),
+    [accessibilityDetail]
+  );
+
+  const folderAccessibilityLocationHints = useMemo(
+    () => buildAccessibilityLocationHints(folderAccessibilityDetail),
+    [folderAccessibilityDetail]
+  );
+
+  useEffect(() => {
+    if (!viewer || viewer.type !== "json" || !viewer.pdfId || !viewer.jsonId) {
+      setAccessibilityDetail(null);
+      setIsLoadingAccessibilityDetail(false);
+      return undefined;
+    }
+    let cancelled = false;
+    setIsLoadingAccessibilityDetail(true);
+    getAccessibilityDetail(viewer.pdfId, viewer.jsonId)
+      .then((data) => {
+        if (!cancelled) {
+          setAccessibilityDetail(data);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setAccessibilityDetail(null);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setIsLoadingAccessibilityDetail(false);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [viewer?.type, viewer?.pdfId, viewer?.jsonId]);
+
+  useEffect(() => {
+    if (!isViewerOpen || !isJsonSelected || !selectedFile?.id || !fileContent || typeof fileContent !== "object" || Array.isArray(fileContent)) {
+      setFolderAccessibilityDetail(null);
+      setIsLoadingFolderAccessibilityDetail(false);
+      return undefined;
+    }
+    if (!folderJsonCompanionPdfId) {
+      setFolderAccessibilityDetail(null);
+      setIsLoadingFolderAccessibilityDetail(false);
+      return undefined;
+    }
+    let cancelled = false;
+    setIsLoadingFolderAccessibilityDetail(true);
+    getAccessibilityDetail(folderJsonCompanionPdfId, selectedFile.id)
+      .then((data) => {
+        if (!cancelled) {
+          setFolderAccessibilityDetail(data);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setFolderAccessibilityDetail(null);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setIsLoadingFolderAccessibilityDetail(false);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    isViewerOpen,
+    isJsonSelected,
+    selectedFile?.id,
+    fileContent,
+    folderJsonCompanionPdfId,
+  ]);
 
   useEffect(() => {
     setRunsPage(1);
@@ -1258,7 +1455,9 @@ function Dashboard() {
                                                         disabled={!canOpenJson}
                                                         onClick={(event) => {
                                                           event.stopPropagation();
-                                                          openFile("json", file?.outputs?.json_url, "Accessibility Report");
+                                                          openFile("json", file?.outputs?.json_url, "Accessibility Report", {
+                                                            companionPdfUrl: file?.outputs?.pdf_url,
+                                                          });
                                                         }}
                                                         className="px-2 py-1 text-xs bg-gray-100 rounded hover:bg-gray-200 disabled:opacity-40 disabled:cursor-not-allowed inline-flex items-center gap-1"
                                                       >
@@ -1540,6 +1739,12 @@ function Dashboard() {
                           Skipped: {summary.skipped}
                         </span>
                       </div>
+                      {folderJsonCompanionPdfId && isLoadingFolderAccessibilityDetail && (
+                        <p className="text-xs text-slate-500 mt-3 flex items-center gap-2">
+                          <span className="inline-block w-3 h-3 border border-slate-300 border-t-slate-600 rounded-full animate-spin" />
+                          Resolving page locations…
+                        </p>
+                      )}
                     </div>
 
                     {jsonSections.length === 0 && (
@@ -1572,10 +1777,33 @@ function Dashboard() {
                                     (normalizedStatus.includes("manual")
                                       ? STATUS_CLASS["needs manual check"]
                                       : "text-gray-700");
+                                  const locKey = `${sectionTitle}|${normalizedEntry.rule}`;
+                                  const { pagesByKey, unlocatable } = folderAccessibilityLocationHints;
+                                  const pages = pagesByKey.get(locKey);
+                                  const isFailedLike = normalizedStatus.includes("failed");
+                                  const isManualLike =
+                                    normalizedStatus.includes("needs manual") ||
+                                    normalizedStatus.includes("manual check");
+                                  const showPages = Boolean(pages?.length);
+                                  const showUnlocatable =
+                                    Boolean(folderAccessibilityDetail) &&
+                                    isFailedLike &&
+                                    !showPages &&
+                                    unlocatable.has(locKey);
+                                  const showManualHint = isManualLike;
                                   return (
                                     <tr key={`${sectionTitle}-${index}`} className="border-t">
                                       <td className="p-2 border">
-                                        {normalizedEntry.rule || `Rule ${index + 1}`}
+                                        <div>{normalizedEntry.rule || `Rule ${index + 1}`}</div>
+                                        {showPages && (
+                                          <div className="text-xs text-slate-600 mt-1">Pages: {pages.join(", ")}</div>
+                                        )}
+                                        {showUnlocatable && (
+                                          <div className="text-xs text-slate-500 mt-1">Page location unknown</div>
+                                        )}
+                                        {showManualHint && (
+                                          <div className="text-xs text-amber-700 mt-1">Review full document</div>
+                                        )}
                                       </td>
                                       <td className={`p-2 border font-medium ${statusClass}`}>{statusValue}</td>
                                       <td className="p-2 border">
@@ -1673,6 +1901,12 @@ function Dashboard() {
                   Skipped: {viewerSummary.skipped}
                 </span>
               </div>
+              {viewer?.pdfId && viewer?.jsonId && isLoadingAccessibilityDetail && (
+                <p className="text-xs text-slate-500 mt-3 flex items-center gap-2">
+                  <span className="inline-block w-3 h-3 border border-slate-300 border-t-slate-600 rounded-full animate-spin" />
+                  Resolving page locations…
+                </p>
+              )}
             </div>
 
             {viewerJsonSections.length === 0 && (
@@ -1705,10 +1939,32 @@ function Dashboard() {
                             (normalizedStatus.includes("manual")
                               ? STATUS_CLASS["needs manual check"]
                               : "text-gray-700");
+                          const locKey = `${sectionTitle}|${normalizedEntry.rule}`;
+                          const { pagesByKey, unlocatable } = accessibilityLocationHints;
+                          const pages = pagesByKey.get(locKey);
+                          const isFailedLike = normalizedStatus.includes("failed");
+                          const isManualLike =
+                            normalizedStatus.includes("needs manual") || normalizedStatus.includes("manual check");
+                          const showPages = Boolean(pages?.length);
+                          const showUnlocatable =
+                            Boolean(accessibilityDetail) &&
+                            isFailedLike &&
+                            !showPages &&
+                            unlocatable.has(locKey);
+                          const showManualHint = isManualLike;
                           return (
                             <tr key={`${sectionTitle}-${index}`} className="border-t">
                               <td className="p-2 border">
-                                {normalizedEntry.rule || `Rule ${index + 1}`}
+                                <div>{normalizedEntry.rule || `Rule ${index + 1}`}</div>
+                                {showPages && (
+                                  <div className="text-xs text-slate-600 mt-1">Pages: {pages.join(", ")}</div>
+                                )}
+                                {showUnlocatable && (
+                                  <div className="text-xs text-slate-500 mt-1">Page location unknown</div>
+                                )}
+                                {showManualHint && (
+                                  <div className="text-xs text-amber-700 mt-1">Review full document</div>
+                                )}
                               </td>
                               <td className={`p-2 border font-medium ${statusClass}`}>{statusValue}</td>
                               <td className="p-2 border">

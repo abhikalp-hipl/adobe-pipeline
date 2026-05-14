@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 from sqlalchemy import select
 
+from app.api.routes.accessibility import router as accessibility_router
 from app.api.routes.auth import router as auth_router
 from app.api.routes.documents import router as documents_router
 from app.api.routes.email_group import router as email_group_router
@@ -59,6 +60,7 @@ app.include_router(auth_router)
 app.include_router(files_router)
 app.include_router(email_group_router)
 app.include_router(runs_router)
+app.include_router(accessibility_router)
 app.include_router(settings_router)
 
 

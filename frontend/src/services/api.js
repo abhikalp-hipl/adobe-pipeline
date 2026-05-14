@@ -99,6 +99,13 @@ export const getRunDetails = async (runId) => {
   return response.data;
 };
 
+export const getAccessibilityDetail = async (pdfId, jsonId) => {
+  const response = await api.get("/accessibility-detail", {
+    params: { pdf_id: pdfId, json_id: jsonId },
+  });
+  return response.data;
+};
+
 export const normalizeRunFiles = (files) =>
   (Array.isArray(files) ? files : []).map((file) => ({
     name: file?.name || file?.file_name || "",
