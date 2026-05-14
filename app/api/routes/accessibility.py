@@ -2,14 +2,16 @@ import json
 import logging
 import tempfile
 from pathlib import Path
+from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.database import get_db
 from app.services.auth.microsoft_auth import MicrosoftAuthError, MicrosoftAuthService
-from app.services.pdf.locator import enrich_report
+from app.services.pdf.accessibility_xlsx import accessibility_report_to_xlsx_bytes
+from app.services.pdf.locator import build_accessibility_export_rows, enrich_report
 from app.services.storage.onedrive import OneDriveClient, OneDriveError, OneDriveNotFoundError
 
 router = APIRouter(tags=["accessibility"])
@@ -50,19 +52,13 @@ def _failures_by_page_from_raw(raw: object) -> dict[str, list[FailureLocation]]:
     }
 
 
-@router.get("/accessibility-detail", response_model=EnrichedReportResponse)
-async def accessibility_detail(
-    pdf_id: str = Query(..., min_length=1, description="OneDrive file id for tagged PDF"),
-    json_id: str = Query(..., min_length=1, description="OneDrive file id for accessibility report JSON"),
-    db: AsyncSession = Depends(get_db),
-) -> EnrichedReportResponse:
-    """
-    Download tagged PDF + Adobe accessibility JSON from OneDrive, then attach per-page
-    localization (where struct-tree rules allow it).
-    """
+async def _load_json_report_and_stage_pdf(
+    pdf_id: str,
+    json_id: str,
+    db: AsyncSession,
+) -> tuple[dict[str, Any], Path]:
     auth_service = MicrosoftAuthService()
     onedrive_client = OneDriveClient()
-    tmp_path: Path | None = None
     try:
         access_token = await auth_service.get_valid_access_token(db=db)
     except MicrosoftAuthError as exc:
@@ -74,7 +70,7 @@ async def accessibility_detail(
     except OneDriveNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="OneDrive file not found.") from exc
     except OneDriveError as exc:
-        logger.exception("accessibility_detail OneDrive download failed")
+        logger.exception("accessibility OneDrive download failed")
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
 
     try:
@@ -101,7 +97,22 @@ async def accessibility_detail(
             detail="Could not stage PDF for analysis.",
         ) from exc
 
+    return payload, tmp_path
+
+
+@router.get("/accessibility-detail", response_model=EnrichedReportResponse)
+async def accessibility_detail(
+    pdf_id: str = Query(..., min_length=1, description="OneDrive file id for tagged PDF"),
+    json_id: str = Query(..., min_length=1, description="OneDrive file id for accessibility report JSON"),
+    db: AsyncSession = Depends(get_db),
+) -> EnrichedReportResponse:
+    """
+    Download tagged PDF + Adobe accessibility JSON from OneDrive, then attach per-page
+    localization (where struct-tree rules allow it).
+    """
+    tmp_path: Path | None = None
     try:
+        payload, tmp_path = await _load_json_report_and_stage_pdf(pdf_id, json_id, db)
         raw = enrich_report(payload, tmp_path)
         return EnrichedReportResponse(
             summary=dict(raw.get("summary") or {}),
@@ -115,3 +126,28 @@ async def accessibility_detail(
                 tmp_path.unlink(missing_ok=True)
             except OSError:
                 logger.warning("Failed to delete temp PDF: path=%s", tmp_path)
+
+
+@router.get("/accessibility-detail/export")
+async def accessibility_detail_export(
+    pdf_id: str = Query(..., min_length=1, description="OneDrive file id for tagged PDF"),
+    json_id: str = Query(..., min_length=1, description="OneDrive file id for accessibility report JSON"),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """Same inputs as /accessibility-detail; returns an .xlsx with summary and detailed rows including Pages."""
+    tmp_path: Path | None = None
+    try:
+        payload, tmp_path = await _load_json_report_and_stage_pdf(pdf_id, json_id, db)
+        summary, rows = build_accessibility_export_rows(payload, tmp_path)
+        body = accessibility_report_to_xlsx_bytes(summary, rows)
+        return Response(
+            content=body,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={'Content-Disposition': 'attachment; filename="accessibility-report.xlsx"'},
+        )
+    finally:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                logger.warning("Failed to delete temp PDF after export: path=%s", tmp_path)

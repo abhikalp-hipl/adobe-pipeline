@@ -4,6 +4,7 @@ import {
   Calendar,
   CheckCircle,
   Code,
+  Download,
   FileText,
   Folder,
   Play,
@@ -33,6 +34,7 @@ import {
   getSettings,
   getFileUrl,
   getAccessibilityDetail,
+  downloadAccessibilityReportXlsx,
   getScheduler,
   runNow,
   saveSettings,
@@ -144,22 +146,47 @@ function normalizeReportEntry(entry) {
   };
 }
 
+function AccessibilityExcelDownloadButton({ busy, onClick }) {
+  return (
+    <button
+      type="button"
+      disabled={busy}
+      onClick={onClick}
+      className="inline-flex items-center gap-1.5 shrink-0 px-3 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm font-medium"
+    >
+      <Download size={16} />
+      {busy ? "Preparing…" : "Download"}
+    </button>
+  );
+}
+
+/** Stem before *_accessibility_report.json / .json (same rules as companion PDF lookup). */
+function stemFromAccessibilityJsonFileName(jsonFileName) {
+  if (!jsonFileName || typeof jsonFileName !== "string") {
+    return "";
+  }
+  const lower = jsonFileName.toLowerCase();
+  if (lower.endsWith("_accessibility_report.json")) {
+    return jsonFileName.slice(0, -"_accessibility_report.json".length);
+  }
+  if (lower.endsWith("_report.json")) {
+    return jsonFileName.slice(0, -"_report.json".length);
+  }
+  if (lower.endsWith(".accessibility-report.json")) {
+    return jsonFileName.slice(0, -".accessibility-report.json".length);
+  }
+  if (lower.endsWith(".json")) {
+    return jsonFileName.slice(0, -".json".length);
+  }
+  return "";
+}
+
 /** OneDrive file id for tagged PDF in the same folder listing, or "". */
 function findCompanionTaggedPdfId(jsonFileName, fileList) {
   if (!jsonFileName || typeof jsonFileName !== "string" || !Array.isArray(fileList)) {
     return "";
   }
-  const lower = jsonFileName.toLowerCase();
-  let stem = "";
-  if (lower.endsWith("_accessibility_report.json")) {
-    stem = jsonFileName.slice(0, -"_accessibility_report.json".length);
-  } else if (lower.endsWith("_report.json")) {
-    stem = jsonFileName.slice(0, -"_report.json".length);
-  } else if (lower.endsWith(".accessibility-report.json")) {
-    stem = jsonFileName.slice(0, -".accessibility-report.json".length);
-  } else if (lower.endsWith(".json")) {
-    stem = jsonFileName.slice(0, -".json".length);
-  }
+  const stem = stemFromAccessibilityJsonFileName(jsonFileName);
   if (!stem) {
     return "";
   }
@@ -338,6 +365,7 @@ function Dashboard() {
   const [isViewerLoading, setIsViewerLoading] = useState(false);
   const [accessibilityDetail, setAccessibilityDetail] = useState(null);
   const [isLoadingAccessibilityDetail, setIsLoadingAccessibilityDetail] = useState(false);
+  const [isExportingAccessibilityReport, setIsExportingAccessibilityReport] = useState(false);
   const [folderAccessibilityDetail, setFolderAccessibilityDetail] = useState(null);
   const [isLoadingFolderAccessibilityDetail, setIsLoadingFolderAccessibilityDetail] = useState(false);
   const activePageRef = useRef(activePage);
@@ -912,8 +940,36 @@ function Dashboard() {
     }
   };
 
+  const handleDownloadAccessibilityXlsx = useCallback(async (pdfId, jsonId, jsonFileName) => {
+    if (!pdfId || !jsonId) {
+      return;
+    }
+    setIsExportingAccessibilityReport(true);
+    setError("");
+    try {
+      const blob = await downloadAccessibilityReportXlsx(pdfId, jsonId);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      const raw = jsonFileName && String(jsonFileName).trim() ? String(jsonFileName).trim() : "";
+      const base =
+        stemFromAccessibilityJsonFileName(raw) || (raw ? raw.replace(/\.json$/i, "") : "") || "document";
+      const baseForName = base.replace(/\.pdf$/i, "") || base;
+      const safe = baseForName.replace(/[^\w.-]+/g, "_").replace(/^\.+$/, "") || "document";
+      a.download = `${safe}_accessibility_report.xlsx`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch {
+      setError("Failed to download accessibility Excel report.");
+    } finally {
+      setIsExportingAccessibilityReport(false);
+    }
+  }, []);
+
   const openFile = async (type, url, title, options = {}) => {
-    const { companionPdfUrl } = options;
+    const { companionPdfUrl, jsonFileName } = options;
     const resolvedUrl = url && url.startsWith("http") ? url : `http://localhost:8000${url || ""}`;
     let companionPdfId = "";
     if (companionPdfUrl) {
@@ -959,6 +1015,7 @@ function Dashboard() {
       title: title || "",
       pdfId: pdfIdForViewer,
       jsonId: jsonIdForViewer,
+      jsonFileName: type === "json" ? jsonFileName || "" : "",
     });
     setIsViewerLoading(true);
     if (type === "pdf") {
@@ -1457,6 +1514,7 @@ function Dashboard() {
                                                           event.stopPropagation();
                                                           openFile("json", file?.outputs?.json_url, "Accessibility Report", {
                                                             companionPdfUrl: file?.outputs?.pdf_url,
+                                                            jsonFileName: file?.name,
                                                           });
                                                         }}
                                                         className="px-2 py-1 text-xs bg-gray-100 rounded hover:bg-gray-200 disabled:opacity-40 disabled:cursor-not-allowed inline-flex items-center gap-1"
@@ -1716,28 +1774,44 @@ function Dashboard() {
                 {!isLoadingContent && !isOpeningFile && (
                   <>
                     <div className="bg-white rounded-xl shadow p-4 mb-4 border">
-                      {summary.description && (
-                        <p className="text-sm text-slate-700 mb-3">{summary.description}</p>
-                      )}
-                      <div className="flex gap-3 flex-wrap">
-                        <span className="px-2 py-1 rounded bg-green-100 text-green-700 text-sm">
-                          Passed: {summary.passed}
-                        </span>
-                        <span className="px-2 py-1 rounded bg-red-100 text-red-700 text-sm">
-                          Failed: {summary.failed}
-                        </span>
-                        <span className="px-2 py-1 rounded bg-yellow-100 text-yellow-700 text-sm">
-                          Needs manual check: {summary.needsManual}
-                        </span>
-                        <span className="px-2 py-1 rounded bg-emerald-100 text-emerald-700 text-sm">
-                          Passed manually: {summary.passedManually}
-                        </span>
-                        <span className="px-2 py-1 rounded bg-rose-100 text-rose-700 text-sm">
-                          Failed manually: {summary.failedManually}
-                        </span>
-                        <span className="px-2 py-1 rounded bg-gray-200 text-gray-700 text-sm">
-                          Skipped: {summary.skipped}
-                        </span>
+                      <div className="flex flex-wrap items-start justify-between gap-3 mb-3">
+                        <div className="flex-1 min-w-[200px]">
+                          {summary.description && (
+                            <p className="text-sm text-slate-700 mb-3">{summary.description}</p>
+                          )}
+                          <div className="flex gap-3 flex-wrap">
+                            <span className="px-2 py-1 rounded bg-green-100 text-green-700 text-sm">
+                              Passed: {summary.passed}
+                            </span>
+                            <span className="px-2 py-1 rounded bg-red-100 text-red-700 text-sm">
+                              Failed: {summary.failed}
+                            </span>
+                            <span className="px-2 py-1 rounded bg-yellow-100 text-yellow-700 text-sm">
+                              Needs manual check: {summary.needsManual}
+                            </span>
+                            <span className="px-2 py-1 rounded bg-emerald-100 text-emerald-700 text-sm">
+                              Passed manually: {summary.passedManually}
+                            </span>
+                            <span className="px-2 py-1 rounded bg-rose-100 text-rose-700 text-sm">
+                              Failed manually: {summary.failedManually}
+                            </span>
+                            <span className="px-2 py-1 rounded bg-gray-200 text-gray-700 text-sm">
+                              Skipped: {summary.skipped}
+                            </span>
+                          </div>
+                        </div>
+                        {folderJsonCompanionPdfId && selectedFile?.id ? (
+                          <AccessibilityExcelDownloadButton
+                            busy={isExportingAccessibilityReport}
+                            onClick={() =>
+                              handleDownloadAccessibilityXlsx(
+                                folderJsonCompanionPdfId,
+                                selectedFile.id,
+                                selectedFile.name || ""
+                              )
+                            }
+                          />
+                        ) : null}
                       </div>
                       {folderJsonCompanionPdfId && isLoadingFolderAccessibilityDetail && (
                         <p className="text-xs text-slate-500 mt-3 flex items-center gap-2">
@@ -1878,28 +1952,40 @@ function Dashboard() {
         {!isViewerLoading && viewer?.type === "json" && (
           <div>
             <div className="bg-white rounded-xl shadow p-4 mb-4 border">
-              {viewerSummary.description && (
-                <p className="text-sm text-slate-700 mb-3">{viewerSummary.description}</p>
-              )}
-              <div className="flex gap-3 flex-wrap">
-                <span className="px-2 py-1 rounded bg-green-100 text-green-700 text-sm">
-                  Passed: {viewerSummary.passed}
-                </span>
-                <span className="px-2 py-1 rounded bg-red-100 text-red-700 text-sm">
-                  Failed: {viewerSummary.failed}
-                </span>
-                <span className="px-2 py-1 rounded bg-yellow-100 text-yellow-700 text-sm">
-                  Needs manual check: {viewerSummary.needsManual}
-                </span>
-                <span className="px-2 py-1 rounded bg-emerald-100 text-emerald-700 text-sm">
-                  Passed manually: {viewerSummary.passedManually}
-                </span>
-                <span className="px-2 py-1 rounded bg-rose-100 text-rose-700 text-sm">
-                  Failed manually: {viewerSummary.failedManually}
-                </span>
-                <span className="px-2 py-1 rounded bg-gray-200 text-gray-700 text-sm">
-                  Skipped: {viewerSummary.skipped}
-                </span>
+              <div className="flex flex-wrap items-start justify-between gap-3 mb-3">
+                <div className="flex-1 min-w-[200px]">
+                  {viewerSummary.description && (
+                    <p className="text-sm text-slate-700 mb-3">{viewerSummary.description}</p>
+                  )}
+                  <div className="flex gap-3 flex-wrap">
+                    <span className="px-2 py-1 rounded bg-green-100 text-green-700 text-sm">
+                      Passed: {viewerSummary.passed}
+                    </span>
+                    <span className="px-2 py-1 rounded bg-red-100 text-red-700 text-sm">
+                      Failed: {viewerSummary.failed}
+                    </span>
+                    <span className="px-2 py-1 rounded bg-yellow-100 text-yellow-700 text-sm">
+                      Needs manual check: {viewerSummary.needsManual}
+                    </span>
+                    <span className="px-2 py-1 rounded bg-emerald-100 text-emerald-700 text-sm">
+                      Passed manually: {viewerSummary.passedManually}
+                    </span>
+                    <span className="px-2 py-1 rounded bg-rose-100 text-rose-700 text-sm">
+                      Failed manually: {viewerSummary.failedManually}
+                    </span>
+                    <span className="px-2 py-1 rounded bg-gray-200 text-gray-700 text-sm">
+                      Skipped: {viewerSummary.skipped}
+                    </span>
+                  </div>
+                </div>
+                {viewer?.pdfId && viewer?.jsonId ? (
+                  <AccessibilityExcelDownloadButton
+                    busy={isExportingAccessibilityReport}
+                    onClick={() =>
+                      handleDownloadAccessibilityXlsx(viewer.pdfId, viewer.jsonId, viewer.jsonFileName || "")
+                    }
+                  />
+                ) : null}
               </div>
               {viewer?.pdfId && viewer?.jsonId && isLoadingAccessibilityDetail && (
                 <p className="text-xs text-slate-500 mt-3 flex items-center gap-2">

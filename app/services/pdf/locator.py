@@ -635,3 +635,75 @@ def enrich_report(report: dict[str, Any], pdf_path: str | Path) -> dict[str, Any
         "unlocatable_failures": unlocatable,
         "manual_check_required": manual_check_required,
     }
+
+
+def _export_rows_from_enriched(report: dict[str, Any], enriched: dict[str, Any]) -> list[dict[str, str]]:
+    def fk(entry: dict[str, Any]) -> tuple[str, str]:
+        return (
+            str(entry.get("category") or entry.get("Category") or "").strip(),
+            str(entry.get("rule") or entry.get("Rule") or "").strip(),
+        )
+
+    pages_by_key: dict[tuple[str, str], set[int]] = defaultdict(set)
+    fbp = enriched.get("failures_by_page")
+    if isinstance(fbp, dict):
+        for page_str, items in fbp.items():
+            if not isinstance(items, list):
+                continue
+            try:
+                page_num = int(page_str)
+            except (TypeError, ValueError):
+                continue
+            for raw in items:
+                if isinstance(raw, dict):
+                    pages_by_key[fk(raw)].add(page_num)
+
+    unlocatable_keys: set[tuple[str, str]] = {fk(x) for x in (enriched.get("unlocatable_failures") or []) if isinstance(x, dict)}
+
+    detailed = report.get("Detailed Report")
+    if not isinstance(detailed, dict):
+        return []
+
+    rows: list[dict[str, str]] = []
+    for category, rules in detailed.items():
+        if not isinstance(rules, list):
+            continue
+        cat_str = str(category).strip()
+        for raw in rules:
+            norm = _normalize_detail_entry(raw)
+            rule_name = norm["Rule"]
+            status_raw = norm["Status"]
+            desc = norm["Description"]
+            key = (cat_str, rule_name)
+            page_nums = sorted(pages_by_key.get(key, set()))
+            pages_str = ", ".join(str(n) for n in page_nums) if page_nums else ""
+
+            status_lower = status_raw.lower()
+            notes_parts: list[str] = []
+            if "needs manual check" in status_lower:
+                notes_parts.append("Review full document")
+            elif "failed" in status_lower and not page_nums and key in unlocatable_keys:
+                notes_parts.append("Page location unknown")
+
+            rows.append(
+                {
+                    "section": cat_str,
+                    "rule": rule_name,
+                    "status": status_raw,
+                    "description": desc,
+                    "pages": pages_str,
+                    "notes": "; ".join(notes_parts),
+                }
+            )
+    return rows
+
+
+def build_accessibility_export_rows(
+    report: dict[str, Any], pdf_path: str | Path
+) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    enriched = enrich_report(report, pdf_path)
+    summary = enriched.get("summary")
+    if not isinstance(summary, dict):
+        summary = {}
+    rows = _export_rows_from_enriched(report, enriched)
+    return summary, rows
