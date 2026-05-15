@@ -6,8 +6,16 @@ function ErrorPopup({ error, onClose, onRetry }) {
   }
 
   return (
-    <div className="fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-50 p-4">
-      <div className="bg-white rounded-xl p-6 w-full max-w-md shadow-lg border">
+    <div
+      className="fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-50 p-4"
+      onClick={onClose}
+      role="presentation"
+    >
+      <div
+        className="bg-white rounded-xl p-6 w-full max-w-md shadow-lg border"
+        onClick={(e) => e.stopPropagation()}
+        role="presentation"
+      >
         <div className="text-red-600 font-semibold mb-2 text-lg">Pipeline Failed</div>
 
         <div className="space-y-2">

@@ -4,10 +4,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import RedirectResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.core.config import settings
 from app.db.database import get_db
-from app.db.models import UserToken
+from app.db.models import Department
 from app.services.auth.microsoft_auth import MicrosoftAuthError, MicrosoftAuthService
 from app.services.storage.onedrive import ensure_pipeline_folders
 
@@ -15,14 +16,35 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 logger = logging.getLogger(__name__)
 
 
-@router.get("/login")
-def microsoft_login() -> RedirectResponse:
+@router.get("/dept/{department_id}/login")
+async def department_microsoft_login(
+    department_id: str,
+    db: AsyncSession = Depends(get_db),
+) -> RedirectResponse:
+    dept = (await db.execute(select(Department).where(Department.id == department_id))).scalars().first()
+    if not dept:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Department not found.")
     auth_service = MicrosoftAuthService()
     state = auth_service.generate_state()
-    response = RedirectResponse(url=auth_service.build_login_url(state=state), status_code=status.HTTP_302_FOUND)
+    login_hint = (dept.admin_email or "").strip() or None
+    # Do not silently reuse the browser's Microsoft session for the wrong account (see settings.MS_DEPT_OAUTH_PROMPT).
+    dept_auth_url = auth_service.build_login_url(
+        state=state,
+        prompt=settings.MS_DEPT_OAUTH_PROMPT,
+        login_hint=login_hint,
+    )
+    response = RedirectResponse(url=dept_auth_url, status_code=status.HTTP_302_FOUND)
     response.set_cookie(
         key="ms_oauth_state",
         value=state,
+        httponly=True,
+        secure=False,
+        samesite="lax",
+        max_age=600,
+    )
+    response.set_cookie(
+        key="ms_oauth_department_id",
+        value=department_id,
         httponly=True,
         secure=False,
         samesite="lax",
@@ -51,37 +73,54 @@ async def microsoft_callback(
     if not state or not expected_state or state != expected_state:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid OAuth state.")
 
+    dept_id = request.cookies.get("ms_oauth_department_id", "").strip()
+
     auth_service = MicrosoftAuthService()
     try:
         token_payload = await auth_service.exchange_code_for_tokens(code=code)
-        await auth_service.save_tokens(db=db, payload=token_payload)
-        await ensure_pipeline_folders(token_payload.access_token)
+        if not dept_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Department context missing. Start Microsoft sign-in from the admin panel.",
+            )
+        await auth_service.save_tokens_for_department(db=db, department_id=dept_id, payload=token_payload)
+        dept = (
+            (
+                await db.execute(
+                    select(Department)
+                    .where(Department.id == dept_id)
+                    .options(selectinload(Department.config))
+                )
+            )
+            .scalars()
+            .first()
+        )
+        cfg = dept.config if dept else None
+        await ensure_pipeline_folders(
+            token_payload.access_token,
+            intake_folder=cfg.intake_folder if cfg else None,
+            processed_folder=cfg.processed_folder if cfg else None,
+            output_success_folder=cfg.output_success_folder if cfg else None,
+            output_failure_folder=cfg.output_failure_folder if cfg else None,
+        )
         logger.info(
-            "Microsoft login success: tenant_id=%s user_email=%s",
+            "Microsoft dept OAuth success: department_id=%s tenant_id=%s user_email=%s",
+            dept_id,
             token_payload.tenant_id,
             token_payload.user_email,
+        )
+        admin_url = settings.FRONTEND_ADMIN_URL.rstrip("/")
+        redirect_url = (
+            f"{admin_url}&dept_oauth=success"
+            if "?" in admin_url
+            else f"{admin_url}?dept_oauth=success"
         )
     except MicrosoftAuthError as exc:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
 
-    response = RedirectResponse(url=settings.FRONTEND_DASHBOARD_URL, status_code=status.HTTP_302_FOUND)
+    response = RedirectResponse(url=redirect_url, status_code=status.HTTP_302_FOUND)
     response.delete_cookie("ms_oauth_state")
+    response.delete_cookie("ms_oauth_department_id")
     return response
 
 
-@router.get("/status")
-async def auth_status(db: AsyncSession = Depends(get_db)) -> dict[str, str | bool]:
-    token_row = (await db.execute(select(UserToken).order_by(UserToken.updated_at.desc()))).scalars().first()
-    if not token_row:
-        return {"authenticated": False, "user_email": ""}
-    return {"authenticated": True, "user_email": token_row.user_email}
-
-
-@router.post("/logout")
-async def auth_logout(db: AsyncSession = Depends(get_db)) -> dict[str, str]:
-    # Single-user/dev setup: clear stored delegated token(s).
-    token_rows = (await db.execute(select(UserToken))).scalars().all()
-    for token_row in token_rows:
-        await db.delete(token_row)
-    await db.commit()
-    return {"detail": "Logged out"}

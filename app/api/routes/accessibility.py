@@ -2,13 +2,14 @@ import json
 import logging
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.database import get_db
+from app.services.auth.app_auth import CurrentUser, require_dept_user
 from app.services.auth.microsoft_auth import MicrosoftAuthError, MicrosoftAuthService
 from app.services.pdf.accessibility_xlsx import accessibility_report_to_xlsx_bytes
 from app.services.pdf.locator import build_accessibility_export_rows, enrich_report
@@ -56,11 +57,12 @@ async def _load_json_report_and_stage_pdf(
     pdf_id: str,
     json_id: str,
     db: AsyncSession,
+    department_id: str,
 ) -> tuple[dict[str, Any], Path]:
     auth_service = MicrosoftAuthService()
     onedrive_client = OneDriveClient()
     try:
-        access_token = await auth_service.get_valid_access_token(db=db)
+        access_token = await auth_service.get_valid_token_for_dept(db, department_id)
     except MicrosoftAuthError as exc:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc)) from exc
 
@@ -102,17 +104,16 @@ async def _load_json_report_and_stage_pdf(
 
 @router.get("/accessibility-detail", response_model=EnrichedReportResponse)
 async def accessibility_detail(
+    user: Annotated[CurrentUser, Depends(require_dept_user)],
     pdf_id: str = Query(..., min_length=1, description="OneDrive file id for tagged PDF"),
     json_id: str = Query(..., min_length=1, description="OneDrive file id for accessibility report JSON"),
     db: AsyncSession = Depends(get_db),
 ) -> EnrichedReportResponse:
-    """
-    Download tagged PDF + Adobe accessibility JSON from OneDrive, then attach per-page
-    localization (where struct-tree rules allow it).
-    """
     tmp_path: Path | None = None
     try:
-        payload, tmp_path = await _load_json_report_and_stage_pdf(pdf_id, json_id, db)
+        payload, tmp_path = await _load_json_report_and_stage_pdf(
+            pdf_id, json_id, db, department_id=user.department_id
+        )
         raw = enrich_report(payload, tmp_path)
         return EnrichedReportResponse(
             summary=dict(raw.get("summary") or {}),
@@ -130,14 +131,16 @@ async def accessibility_detail(
 
 @router.get("/accessibility-detail/export")
 async def accessibility_detail_export(
+    user: Annotated[CurrentUser, Depends(require_dept_user)],
     pdf_id: str = Query(..., min_length=1, description="OneDrive file id for tagged PDF"),
     json_id: str = Query(..., min_length=1, description="OneDrive file id for accessibility report JSON"),
     db: AsyncSession = Depends(get_db),
 ) -> Response:
-    """Same inputs as /accessibility-detail; returns an .xlsx with summary and detailed rows including Pages."""
     tmp_path: Path | None = None
     try:
-        payload, tmp_path = await _load_json_report_and_stage_pdf(pdf_id, json_id, db)
+        payload, tmp_path = await _load_json_report_and_stage_pdf(
+            pdf_id, json_id, db, department_id=user.department_id
+        )
         summary, rows = build_accessibility_export_rows(payload, tmp_path)
         body = accessibility_report_to_xlsx_bytes(summary, rows)
         return Response(

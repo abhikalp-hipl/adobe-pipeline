@@ -17,6 +17,7 @@ import ExcelViewer from "../components/ExcelViewer";
 import FileTable from "../components/FileTable";
 import DailyReportModal from "../components/DailyReportModal";
 import EmailModal from "../components/EmailModal";
+import DepartmentSettingsPanel from "../components/DepartmentSettingsPanel";
 import Modal from "../components/Modal";
 import Navbar from "../components/Navbar";
 import Sidebar from "../components/Sidebar";
@@ -26,7 +27,9 @@ import {
   deleteEmailGroup,
   getFileContent,
   getFileContentArrayBuffer,
-  getFilePreviewPdfUrl,
+  fetchAuthenticatedFileBlobUrl,
+  fetchAuthenticatedPreviewPdfBlobUrl,
+  revokeObjectUrl,
   getEmailGroup,
   getFiles,
   getRunFiles,
@@ -40,6 +43,13 @@ import {
   saveSettings,
   normalizeRunFiles,
   updateScheduler,
+  setAppJwt,
+  getAppJwt,
+  parseJwtPayload,
+  dashboardScopedCacheKey,
+  clearDashboardSessionCache,
+  getDepartmentMe,
+  getDepartmentMicrosoftStatus,
 } from "../services/api";
 
 const FOLDERS = [
@@ -77,6 +87,20 @@ const DASHBOARD_CACHE_KEYS = {
   runFilesByRunId: "dashboard_run_files_by_id_cache_v1",
   folderFilesByFolder: "dashboard_folder_files_cache_v1",
 };
+
+const scopedCacheKey = (baseKey) => dashboardScopedCacheKey(baseKey);
+
+function fileFetchErrorMessage(err) {
+  const status = err?.response?.status;
+  const detail = err?.response?.data?.detail;
+  if (status === 401) {
+    return (
+      detail ||
+      "Microsoft OneDrive is not connected for this department. Ask your administrator to connect Microsoft in the Admin panel, then refresh."
+    );
+  }
+  return detail || "Failed to fetch files from OneDrive.";
+}
 
 function readSessionCache(key, maxAgeMs, fallback) {
   if (typeof window === "undefined") {
@@ -302,8 +326,9 @@ function fileTypeIcon(file) {
   return <Folder size={18} className="text-gray-500" />;
 }
 
-function Dashboard() {
-  const [activePage, setActivePage] = useState("dashboard");
+function Dashboard({ initialActivePage = "dashboard" }) {
+  const jwtPayload = useMemo(() => parseJwtPayload(getAppJwt()), []);
+  const [activePage, setActivePage] = useState(initialActivePage);
   const [selectedFolder, setSelectedFolder] = useState("intake");
   const [files, setFiles] = useState([]);
   const [selectedFile, setSelectedFile] = useState(null);
@@ -313,8 +338,11 @@ function Dashboard() {
   const [isLoadingContent, setIsLoadingContent] = useState(false);
   const [isOpeningFile, setIsOpeningFile] = useState(false);
   const [error, setError] = useState("");
+  const [departmentName, setDepartmentName] = useState("");
+  const [microsoftStatus, setMicrosoftStatus] = useState(null);
   const [isViewerOpen, setIsViewerOpen] = useState(false);
   const [docPreviewUrl, setDocPreviewUrl] = useState("");
+  const [pdfBlobUrl, setPdfBlobUrl] = useState("");
   const [showModal, setShowModal] = useState(false);
   const [showReportModal, setShowReportModal] = useState(false);
   const [value, setValue] = useState(5);
@@ -324,7 +352,7 @@ function Dashboard() {
   const [searchQuery, setSearchQuery] = useState("");
   const [lastUpdatedAt, setLastUpdatedAt] = useState(null);
   const [lastDashboardUpdatedAt, setLastDashboardUpdatedAt] = useState(
-    () => readSessionCache(DASHBOARD_CACHE_KEYS.dashboardUpdatedAt, DASHBOARD_CACHE_TTL_MS, null)
+    () => readSessionCache(scopedCacheKey(DASHBOARD_CACHE_KEYS.dashboardUpdatedAt), DASHBOARD_CACHE_TTL_MS, null)
   );
   const [folderCounts, setFolderCounts] = useState({
     intake: 0,
@@ -341,14 +369,14 @@ function Dashboard() {
   const [emailToast, setEmailToast] = useState("");
   const [showEmailModal, setShowEmailModal] = useState(false);
   const [runs, setRuns] = useState(
-    () => readSessionCache(DASHBOARD_CACHE_KEYS.runs, DASHBOARD_CACHE_TTL_MS, [])
+    () => readSessionCache(scopedCacheKey(DASHBOARD_CACHE_KEYS.runs), DASHBOARD_CACHE_TTL_MS, [])
   );
   const [expandedRunId, setExpandedRunId] = useState("");
   const [runFilesByRunId, setRunFilesByRunId] = useState(
-    () => readSessionCache(DASHBOARD_CACHE_KEYS.runFilesByRunId, RUN_FILES_CACHE_TTL_MS, {})
+    () => readSessionCache(scopedCacheKey(DASHBOARD_CACHE_KEYS.runFilesByRunId), RUN_FILES_CACHE_TTL_MS, {})
   );
   const [dashboardFiles, setDashboardFiles] = useState(
-    () => readSessionCache(DASHBOARD_CACHE_KEYS.dashboardFiles, DASHBOARD_CACHE_TTL_MS, [])
+    () => readSessionCache(scopedCacheKey(DASHBOARD_CACHE_KEYS.dashboardFiles), DASHBOARD_CACHE_TTL_MS, [])
   );
   const [isLoadingDashboardFiles, setIsLoadingDashboardFiles] = useState(false);
   const [isLoadingRuns, setIsLoadingRuns] = useState(false);
@@ -373,7 +401,7 @@ function Dashboard() {
   const runFilesByRunIdRef = useRef(runFilesByRunId);
   const folderFetchRequestIdRef = useRef(0);
   const folderFilesCacheRef = useRef(
-    readSessionCache(DASHBOARD_CACHE_KEYS.folderFilesByFolder, FOLDER_FILES_STORAGE_MAX_AGE_MS, {})
+    readSessionCache(scopedCacheKey(DASHBOARD_CACHE_KEYS.folderFilesByFolder), FOLDER_FILES_STORAGE_MAX_AGE_MS, {})
   );
 
   const intervalOptions = [1, 2, 5, 10, 15, 30, 60];
@@ -393,8 +421,8 @@ function Dashboard() {
         "output/success": Array.isArray(outputSuccess) ? outputSuccess.length : 0,
         "output/failure": Array.isArray(outputFailure) ? outputFailure.length : 0,
       });
-    } catch {
-      // ignore count errors
+    } catch (requestError) {
+      setError(fileFetchErrorMessage(requestError));
     }
   }, []);
 
@@ -412,7 +440,7 @@ function Dashboard() {
         ...folderFilesCacheRef.current,
         ...nextCache,
       };
-      writeSessionCache(DASHBOARD_CACHE_KEYS.folderFilesByFolder, folderFilesCacheRef.current);
+      writeSessionCache(scopedCacheKey(DASHBOARD_CACHE_KEYS.folderFilesByFolder), folderFilesCacheRef.current);
       setFolderCounts((prev) => {
         const next = { ...prev };
         Object.entries(nextCache).forEach(([key, payload]) => {
@@ -425,8 +453,8 @@ function Dashboard() {
         setFiles(selectedCached.files);
         setLastUpdatedAt(new Date(selectedCached.ts).toISOString());
       }
-    } catch {
-      // ignore prefetch errors; per-folder fetch path remains fallback
+    } catch (requestError) {
+      setError(fileFetchErrorMessage(requestError));
     }
   }, []);
 
@@ -471,7 +499,7 @@ function Dashboard() {
         files: normalizedFiles,
         ts: Date.now(),
       };
-      writeSessionCache(DASHBOARD_CACHE_KEYS.folderFilesByFolder, folderFilesCacheRef.current);
+      writeSessionCache(scopedCacheKey(DASHBOARD_CACHE_KEYS.folderFilesByFolder), folderFilesCacheRef.current);
       setFiles(normalizedFiles);
       setFolderCounts((prev) => ({
         ...prev,
@@ -482,7 +510,7 @@ function Dashboard() {
       if (requestId !== folderFetchRequestIdRef.current || folderKey !== selectedFolderRef.current) {
         return;
       }
-      setError(requestError?.response?.data?.detail || "Failed to fetch files.");
+      setError(fileFetchErrorMessage(requestError));
     } finally {
       if (requestId === folderFetchRequestIdRef.current && folderKey === selectedFolderRef.current) {
         setIsLoadingFiles(false);
@@ -520,19 +548,41 @@ function Dashboard() {
     prefetchAllFolderFiles();
   }, [prefetchAllFolderFiles]);
 
+  useEffect(() => {
+    let cancelled = false;
+    const loadDepartmentContext = async () => {
+      try {
+        const [dept, status] = await Promise.all([getDepartmentMe(), getDepartmentMicrosoftStatus()]);
+        if (!cancelled) {
+          setDepartmentName(dept?.name || "");
+          setMicrosoftStatus(status);
+        }
+      } catch {
+        if (!cancelled) {
+          setDepartmentName("");
+          setMicrosoftStatus({ connected: false, connected_email: null });
+        }
+      }
+    };
+    loadDepartmentContext();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const refreshDashboard = useCallback(async ({ full = false } = {}) => {
     setIsLoadingDashboardFiles((dashboardFiles || []).length === 0);
     try {
       const data = await getRuns();
       const nextRuns = Array.isArray(data) ? data : [];
       setRuns(nextRuns);
-      writeSessionCache(DASHBOARD_CACHE_KEYS.runs, nextRuns);
+      writeSessionCache(scopedCacheKey(DASHBOARD_CACHE_KEYS.runs), nextRuns);
       if (nextRuns.length === 0) {
         setDashboardFiles([]);
-        writeSessionCache(DASHBOARD_CACHE_KEYS.dashboardFiles, []);
+        writeSessionCache(scopedCacheKey(DASHBOARD_CACHE_KEYS.dashboardFiles), []);
         const updatedAt = new Date().toISOString();
         setLastDashboardUpdatedAt(updatedAt);
-        writeSessionCache(DASHBOARD_CACHE_KEYS.dashboardUpdatedAt, updatedAt);
+        writeSessionCache(scopedCacheKey(DASHBOARD_CACHE_KEYS.dashboardUpdatedAt), updatedAt);
         return;
       }
       // Fast path for live refresh: only fetch missing recent runs.
@@ -550,7 +600,7 @@ function Dashboard() {
       });
       const mergedRunFilesById = { ...existingRunFiles, ...fetchedRunFilesById };
       setRunFilesByRunId(mergedRunFilesById);
-      writeSessionCache(DASHBOARD_CACHE_KEYS.runFilesByRunId, mergedRunFilesById);
+      writeSessionCache(scopedCacheKey(DASHBOARD_CACHE_KEYS.runFilesByRunId), mergedRunFilesById);
 
       const normalized = candidateRuns
         .flatMap((run) => mergedRunFilesById[run.run_id] || [])
@@ -558,10 +608,10 @@ function Dashboard() {
       normalized.sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
       const nextDashboardFiles = normalized;
       setDashboardFiles(nextDashboardFiles);
-      writeSessionCache(DASHBOARD_CACHE_KEYS.dashboardFiles, nextDashboardFiles);
+      writeSessionCache(scopedCacheKey(DASHBOARD_CACHE_KEYS.dashboardFiles), nextDashboardFiles);
       const updatedAt = new Date().toISOString();
       setLastDashboardUpdatedAt(updatedAt);
-      writeSessionCache(DASHBOARD_CACHE_KEYS.dashboardUpdatedAt, updatedAt);
+      writeSessionCache(scopedCacheKey(DASHBOARD_CACHE_KEYS.dashboardUpdatedAt), updatedAt);
     } catch {
       setError("Failed to refresh dashboard.");
     } finally {
@@ -578,7 +628,7 @@ function Dashboard() {
         if (!cancelled) {
           const nextRuns = Array.isArray(data) ? data : [];
           setRuns(nextRuns);
-          writeSessionCache(DASHBOARD_CACHE_KEYS.runs, nextRuns);
+          writeSessionCache(scopedCacheKey(DASHBOARD_CACHE_KEYS.runs), nextRuns);
         }
       } catch {
         if (!cancelled) {
@@ -754,7 +804,10 @@ function Dashboard() {
     setSelectedFile(file);
     setFileContent(null);
     setXlsxContent(null);
+    revokeObjectUrl(docPreviewUrl);
+    revokeObjectUrl(pdfBlobUrl);
     setDocPreviewUrl("");
+    setPdfBlobUrl("");
     setIsViewerOpen(true);
     setIsOpeningFile(true);
     const isJsonFile =
@@ -767,6 +820,8 @@ function Dashboard() {
       file?.name?.toLowerCase().endsWith(".doc") ||
       file?.mime_type === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
       file?.mime_type === "application/msword";
+    const isPdfFile =
+      file?.name?.toLowerCase().endsWith(".pdf") || file?.mime_type === "application/pdf";
     if (!isJsonFile) {
       if (isXlsxFile) {
         setIsLoadingContent(true);
@@ -780,11 +835,37 @@ function Dashboard() {
           setIsLoadingContent(false);
           setIsOpeningFile(false);
         }
+        return;
       }
       if (isDocFile) {
         setError("");
-        setDocPreviewUrl(getFilePreviewPdfUrl(file.id));
+        setIsLoadingContent(true);
+        try {
+          const blobUrl = await fetchAuthenticatedPreviewPdfBlobUrl(file.id);
+          setDocPreviewUrl(blobUrl);
+        } catch (requestError) {
+          setError(requestError?.response?.data?.detail || "Failed to load document preview.");
+        } finally {
+          setIsLoadingContent(false);
+          setIsOpeningFile(false);
+        }
+        return;
       }
+      if (isPdfFile) {
+        setError("");
+        setIsLoadingContent(true);
+        try {
+          const blobUrl = await fetchAuthenticatedFileBlobUrl(file.id);
+          setPdfBlobUrl(blobUrl);
+        } catch (requestError) {
+          setError(requestError?.response?.data?.detail || "Failed to load PDF file.");
+        } finally {
+          setIsLoadingContent(false);
+          setIsOpeningFile(false);
+        }
+        return;
+      }
+      setIsOpeningFile(false);
       return;
     }
     setIsLoadingContent(true);
@@ -803,12 +884,15 @@ function Dashboard() {
   };
 
   const closeViewer = () => {
+    revokeObjectUrl(docPreviewUrl);
+    revokeObjectUrl(pdfBlobUrl);
     setIsViewerOpen(false);
     setSelectedFile(null);
     setFileContent(null);
     setXlsxContent(null);
     setIsOpeningFile(false);
     setDocPreviewUrl("");
+    setPdfBlobUrl("");
     setFolderAccessibilityDetail(null);
     setIsLoadingFolderAccessibilityDetail(false);
   };
@@ -882,8 +966,9 @@ function Dashboard() {
   };
 
   const handleLogout = () => {
-    fetch("http://localhost:8000/auth/logout", { method: "POST" }).catch(() => {});
-    window.location.href = "/";
+    clearDashboardSessionCache();
+    setAppJwt(null);
+    window.location.href = "/login";
   };
 
   const parsedEmailCandidates = useMemo(
@@ -1012,6 +1097,7 @@ function Dashboard() {
     setViewer({
       type,
       url: resolvedUrl,
+      blobUrl: "",
       title: title || "",
       pdfId: pdfIdForViewer,
       jsonId: jsonIdForViewer,
@@ -1019,6 +1105,15 @@ function Dashboard() {
     });
     setIsViewerLoading(true);
     if (type === "pdf") {
+      try {
+        const blobUrl = await fetchAuthenticatedFileBlobUrl(fileId);
+        setViewer((prev) => (prev ? { ...prev, blobUrl } : prev));
+      } catch {
+        setError("Failed to open output file.");
+        setViewer(null);
+      } finally {
+        setIsViewerLoading(false);
+      }
       return;
     }
     try {
@@ -1037,6 +1132,9 @@ function Dashboard() {
   };
 
   const closeRunOutputViewer = () => {
+    if (viewer?.blobUrl) {
+      revokeObjectUrl(viewer.blobUrl);
+    }
     setViewer(null);
     setViewerJson(null);
     setViewerXlsx(null);
@@ -1060,7 +1158,7 @@ function Dashboard() {
       const normalizedFiles = normalizeRunFiles(files);
       setRunFilesByRunId((prev) => {
         const next = { ...prev, [runId]: normalizedFiles };
-        writeSessionCache(DASHBOARD_CACHE_KEYS.runFilesByRunId, next);
+        writeSessionCache(scopedCacheKey(DASHBOARD_CACHE_KEYS.runFilesByRunId), next);
         return next;
       });
     } catch {
@@ -1287,11 +1385,12 @@ function Dashboard() {
         setSelectedFolder={setSelectedFolder}
         folderCounts={folderCounts}
         onFolderSelect={handleFolderSelect}
+        userRole={jwtPayload?.role}
       />
 
-      <main className="flex-1 p-6 bg-gray-100 overflow-y-auto">
+      <main className="flex-1 min-w-0 bg-gray-100 overflow-y-auto">
         <Navbar
-          activePage={activePage}
+          departmentName={departmentName}
           isRunning={showRunningState}
           onRunNow={handleRunNow}
           onOpenSchedule={() => setShowModal(true)}
@@ -1301,6 +1400,17 @@ function Dashboard() {
           setShowProfileMenu={setShowProfileMenu}
           onLogout={handleLogout}
         />
+
+        <div className="px-6 pb-6 pt-4">
+        {microsoftStatus?.connected === false && (
+          <div className="mb-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+            <p className="font-medium">OneDrive folders unavailable</p>
+            <p className="mt-1 text-amber-800">
+              Microsoft OneDrive is not connected for this department. Ask your administrator to open the Admin
+              panel, use Connect on this department&apos;s row, then refresh this page.
+            </p>
+          </div>
+        )}
 
         {activePage === "dashboard" && (
           <FileTable
@@ -1342,9 +1452,13 @@ function Dashboard() {
             )}
             {!isLoadingFiles && filteredFiles.length === 0 && (
               <div className="border border-dashed rounded-xl p-8 text-center bg-gray-50">
-                <div className="text-lg font-semibold text-gray-800">No files found</div>
-                <div className="text-sm text-gray-500 mt-1">
-                  {searchQuery ? "Try a different search term." : "This folder is currently empty."}
+                <div className="text-lg font-semibold text-gray-800">{error ? "Could not load folder files" : "No files found"}</div>
+                <div className={`text-sm mt-1 ${error ? "text-red-600" : "text-gray-500"}`}>
+                  {error
+                    ? error
+                    : searchQuery
+                      ? "Try a different search term."
+                      : "This folder is currently empty."}
                 </div>
               </div>
             )}
@@ -1373,6 +1487,8 @@ function Dashboard() {
             </div>
           </section>
         )}
+
+        {activePage === "dept-settings" && <DepartmentSettingsPanel />}
 
         {activePage === "runs" && (
           <>
@@ -1586,11 +1702,16 @@ function Dashboard() {
             </section>
           </>
         )}
+        </div>
       </main>
 
       {showModal && (
-        <div className="fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-50">
-          <div className="bg-white rounded-xl p-6 w-96 shadow-lg">
+        <div
+          className="fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-50"
+          onClick={() => setShowModal(false)}
+          role="presentation"
+        >
+          <div className="bg-white rounded-xl p-6 w-96 shadow-lg" onClick={(e) => e.stopPropagation()} role="presentation">
             <h3 className="text-lg font-semibold mb-4">Set Schedule Interval</h3>
 
             <p className="text-sm text-gray-500 mb-2">
@@ -1680,8 +1801,16 @@ function Dashboard() {
       )}
 
       {isViewerOpen && selectedFile && (
-        <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
-          <div className="bg-white rounded-xl shadow-xl w-full max-w-[96vw] max-h-[94vh] overflow-y-auto p-4">
+        <div
+          className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4"
+          onClick={closeViewer}
+          role="presentation"
+        >
+          <div
+            className="bg-white rounded-xl shadow-xl w-full max-w-[96vw] max-h-[94vh] overflow-y-auto p-4"
+            onClick={(e) => e.stopPropagation()}
+            role="presentation"
+          >
             <div className="flex items-center justify-between mb-4">
               <h2 className="text-lg font-semibold break-all pr-4">{selectedFile.name}</h2>
               <button
@@ -1703,13 +1832,19 @@ function Dashboard() {
                     </div>
                   </div>
                 )}
-                <iframe
-                  src={getFileUrl(selectedFile.id)}
-                  title={selectedFile.name}
-                  className="w-full h-[80vh] rounded"
-                  onLoad={() => setIsOpeningFile(false)}
-                  onError={() => setIsOpeningFile(false)}
-                />
+                {pdfBlobUrl ? (
+                  <iframe
+                    src={pdfBlobUrl}
+                    title={selectedFile.name}
+                    className="w-full h-[80vh] rounded"
+                    onLoad={() => setIsOpeningFile(false)}
+                    onError={() => setIsOpeningFile(false)}
+                  />
+                ) : (
+                  <div className="w-full h-[80vh] rounded border bg-gray-50 flex items-center justify-center text-sm text-gray-500">
+                    {isOpeningFile || isLoadingContent ? "Loading PDF…" : "PDF preview unavailable."}
+                  </div>
+                )}
               </div>
             )}
 
@@ -1932,13 +2067,19 @@ function Dashboard() {
         )}
         {viewer?.type === "pdf" && (
           <div className="relative w-full h-full min-h-[60vh]">
-            <iframe
-              src={viewer.url}
-              title="Output PDF"
-              className="w-full h-full rounded border"
-              onLoad={() => setIsViewerLoading(false)}
-              onError={() => setIsViewerLoading(false)}
-            />
+            {viewer.blobUrl ? (
+              <iframe
+                src={viewer.blobUrl}
+                title="Output PDF"
+                className="w-full h-full rounded border"
+                onLoad={() => setIsViewerLoading(false)}
+                onError={() => setIsViewerLoading(false)}
+              />
+            ) : (
+              <div className="w-full h-full min-h-[40vh] rounded border bg-gray-50 flex items-center justify-center text-sm text-gray-500">
+                {isViewerLoading ? "Loading tagged PDF…" : "PDF preview unavailable."}
+              </div>
+            )}
             {isViewerLoading && (
               <div className="absolute inset-0 bg-white/80 flex items-center justify-center rounded">
                 <div className="flex items-center gap-2 text-sm text-gray-600">

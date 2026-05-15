@@ -19,8 +19,16 @@ export default function EmailModal({
   }
 
   return (
-    <div className="fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-50 p-4">
-      <div className="bg-white rounded-xl w-[400px] p-6 shadow-lg max-h-[85vh] overflow-y-auto">
+    <div
+      className="fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-50 p-4"
+      onClick={onClose}
+      role="presentation"
+    >
+      <div
+        className="bg-white rounded-xl w-[400px] p-6 shadow-lg max-h-[85vh] overflow-y-auto"
+        onClick={(e) => e.stopPropagation()}
+        role="presentation"
+      >
         <div className="mb-4">
           <h2 className="text-lg font-semibold flex items-center gap-2">
             <Mail size={16} />

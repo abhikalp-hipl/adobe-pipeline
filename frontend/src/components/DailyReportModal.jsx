@@ -38,13 +38,14 @@ export default function DailyReportModal({
   return (
     <div
       className="fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-50 p-4"
-      onClick={(event) => {
-        if (event.target === event.currentTarget) {
-          onClose();
-        }
-      }}
+      onClick={onClose}
+      role="presentation"
     >
-      <div className="bg-white rounded-xl w-[420px] p-6 shadow-lg transition-all duration-200 ease-out">
+      <div
+        className="bg-white rounded-xl w-[420px] p-6 shadow-lg transition-all duration-200 ease-out"
+        onClick={(e) => e.stopPropagation()}
+        role="presentation"
+      >
         <h3 className="text-lg font-semibold">Daily Report Settings</h3>
 
         <div className="space-y-4 mt-4">

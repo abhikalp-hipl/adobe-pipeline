@@ -1,4 +1,5 @@
 import logging
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -7,6 +8,7 @@ from app.core.config import settings
 from app.db.database import get_db
 from app.schemas.document import DocumentResponse
 from app.services.adobe.client import AdobeAPIError
+from app.services.auth.app_auth import CurrentUser, require_dept_user
 from app.services.auth.microsoft_auth import MicrosoftAuthError
 from app.services.document_service import (
     DocumentServiceError,
@@ -24,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 @router.post("/upload", response_model=DocumentResponse, status_code=status.HTTP_201_CREATED)
 async def upload_document_endpoint(
+    user: Annotated[CurrentUser, Depends(require_dept_user)],
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db),
 ) -> DocumentResponse:
@@ -34,7 +37,7 @@ async def upload_document_endpoint(
         )
     logger.info("Upload request received: filename=%s", file.filename)
     try:
-        document = await upload_document(file=file, db=db)
+        document = await upload_document(file=file, db=db, department_id=user.department_id)
         logger.info("Upload completed: document_id=%s status=%s", document.id, document.status.value)
         return DocumentResponse.model_validate(document)
     except HTTPException:
@@ -48,8 +51,11 @@ async def upload_document_endpoint(
 
 
 @router.get("", response_model=list[DocumentResponse])
-async def list_documents_endpoint(db: AsyncSession = Depends(get_db)) -> list[DocumentResponse]:
-    documents = await list_documents(db=db)
+async def list_documents_endpoint(
+    user: Annotated[CurrentUser, Depends(require_dept_user)],
+    db: AsyncSession = Depends(get_db),
+) -> list[DocumentResponse]:
+    documents = await list_documents(db=db, department_id=user.department_id)
     logger.info("List documents request completed: count=%d", len(documents))
     return [DocumentResponse.model_validate(document) for document in documents]
 
@@ -57,9 +63,10 @@ async def list_documents_endpoint(db: AsyncSession = Depends(get_db)) -> list[Do
 @router.get("/{document_id}", response_model=DocumentResponse)
 async def get_document_endpoint(
     document_id: str,
+    user: Annotated[CurrentUser, Depends(require_dept_user)],
     db: AsyncSession = Depends(get_db),
 ) -> DocumentResponse:
-    document = await get_document_by_id(document_id=document_id, db=db)
+    document = await get_document_by_id(document_id=document_id, db=db, department_id=user.department_id)
     logger.info("Get document request completed: document_id=%s status=%s", document.id, document.status.value)
     return DocumentResponse.model_validate(document)
 
@@ -67,6 +74,7 @@ async def get_document_endpoint(
 @router.post("/{document_id}/process")
 async def process_document_endpoint(
     document_id: str,
+    user: Annotated[CurrentUser, Depends(require_dept_user)],
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, str]:
     if settings.STORAGE_PROVIDER == "onedrive":
@@ -75,6 +83,7 @@ async def process_document_endpoint(
             detail="Manual local processing is disabled in OneDrive-only mode. Use /documents/onedrive/process-intake.",
         )
     logger.info("Process request received: document_id=%s", document_id)
+    await get_document_by_id(document_id=document_id, db=db, department_id=user.department_id)
     orchestrator = Orchestrator(db=db)
     try:
         result = await orchestrator.process_document(document_id=document_id)
@@ -103,6 +112,7 @@ async def process_document_endpoint(
 @router.post("/onedrive/process-intake")
 async def process_onedrive_intake_endpoint(
     request: Request,
+    user: Annotated[CurrentUser, Depends(require_dept_user)],
 ) -> dict[str, int]:
     if settings.STORAGE_PROVIDER != "onedrive":
         raise HTTPException(
@@ -114,7 +124,7 @@ async def process_onedrive_intake_endpoint(
     if not scheduler:
         scheduler = Scheduler()
     try:
-        return await scheduler.process_onedrive_intake()
+        return await scheduler.process_onedrive_intake(department_id=user.department_id)
     except OneDriveAuthError as exc:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

@@ -1,5 +1,6 @@
 import json
 from datetime import datetime
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict
@@ -7,9 +8,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.database import get_db
-from app.db.models import PipelineRun, PipelineRunFile, PipelineRunStatus
+from app.db.models import DepartmentConfig, PipelineRun, PipelineRunFile, PipelineRunStatus
+from app.services.auth.app_auth import CurrentUser, require_dept_user
 from app.services.auth.microsoft_auth import MicrosoftAuthError, MicrosoftAuthService
-from app.services.storage.onedrive import OUTPUT_SUCCESS_FOLDER, OneDriveClient, OneDriveError, OneDriveNotFoundError
+from app.services.storage.onedrive import OneDriveClient, OneDriveError, OneDriveNotFoundError
 
 router = APIRouter(tags=["runs"])
 
@@ -49,37 +51,63 @@ class PipelineRunDetailsResponse(BaseModel):
 
 
 @router.get("/runs", response_model=list[PipelineRunListItem])
-async def list_runs(db: AsyncSession = Depends(get_db)) -> list[PipelineRun]:
-    return (await db.execute(select(PipelineRun).order_by(PipelineRun.start_time.desc()))).scalars().all()
+async def list_runs(
+    user: Annotated[CurrentUser, Depends(require_dept_user)],
+    db: AsyncSession = Depends(get_db),
+) -> list[PipelineRun]:
+    stmt = select(PipelineRun).where(PipelineRun.department_id == user.department_id).order_by(PipelineRun.start_time.desc())
+    return (await db.execute(stmt)).scalars().all()
 
 
 @router.get("/runs/{run_id}/files", response_model=list[PipelineRunFileItem])
-async def list_run_files(run_id: str, db: AsyncSession = Depends(get_db)) -> list[PipelineRunFile]:
-    run = (await db.execute(select(PipelineRun).where(PipelineRun.run_id == run_id))).scalars().first()
+async def list_run_files(
+    run_id: str,
+    user: Annotated[CurrentUser, Depends(require_dept_user)],
+    db: AsyncSession = Depends(get_db),
+) -> list[PipelineRunFile]:
+    run = (
+        await db.execute(
+            select(PipelineRun).where(
+                PipelineRun.run_id == run_id,
+                PipelineRun.department_id == user.department_id,
+            )
+        )
+    ).scalars().first()
     if not run:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found.")
     rows = (
         await db.execute(select(PipelineRunFile).where(PipelineRunFile.run_id == run.id).order_by(PipelineRunFile.created_at.asc()))
     ).scalars().all()
-    output_lookup, _grouped_outputs = await _build_output_catalog(db=db)
+    output_lookup, _grouped_outputs = await _build_output_catalog(db=db, department_id=user.department_id)
     response: list[PipelineRunFileItem] = []
     for row in rows:
-        response.append(await _to_run_file_item(row, output_lookup=output_lookup))
+        response.append(await _to_run_file_item(row, output_lookup=output_lookup, department_id=user.department_id))
     return response
 
 
 @router.get("/runs/{run_id}", response_model=PipelineRunDetailsResponse)
-async def get_run_details(run_id: str, db: AsyncSession = Depends(get_db)) -> PipelineRunDetailsResponse:
-    run = (await db.execute(select(PipelineRun).where(PipelineRun.run_id == run_id))).scalars().first()
+async def get_run_details(
+    run_id: str,
+    user: Annotated[CurrentUser, Depends(require_dept_user)],
+    db: AsyncSession = Depends(get_db),
+) -> PipelineRunDetailsResponse:
+    run = (
+        await db.execute(
+            select(PipelineRun).where(
+                PipelineRun.run_id == run_id,
+                PipelineRun.department_id == user.department_id,
+            )
+        )
+    ).scalars().first()
     if not run:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found.")
     rows = (
         await db.execute(select(PipelineRunFile).where(PipelineRunFile.run_id == run.id).order_by(PipelineRunFile.created_at.asc()))
     ).scalars().all()
-    output_lookup, _grouped_outputs = await _build_output_catalog(db=db)
+    output_lookup, _grouped_outputs = await _build_output_catalog(db=db, department_id=user.department_id)
     files: list[PipelineRunFileItem] = []
     for row in rows:
-        files.append(await _to_run_file_item(row, output_lookup=output_lookup))
+        files.append(await _to_run_file_item(row, output_lookup=output_lookup, department_id=user.department_id))
     return PipelineRunDetailsResponse(
         run_id=run.run_id,
         start_time=run.start_time,
@@ -95,6 +123,8 @@ async def get_run_details(run_id: str, db: AsyncSession = Depends(get_db)) -> Pi
 async def _to_run_file_item(
     row: PipelineRunFile,
     output_lookup: dict[str, str],
+    *,
+    department_id: str,
 ) -> PipelineRunFileItem:
     persisted_stem = (getattr(row, "output_stem", None) or "").strip()
     stem = persisted_stem or _derive_output_stem(row.file_name)
@@ -132,8 +162,7 @@ async def _to_run_file_item(
     if is_failed or not json_id or has_non_zero_stored_values:
         accessibility = stored_accessibility
     else:
-        # Backward compatibility for older rows created before accessibility counters were persisted.
-        accessibility = await _read_accessibility_counts(json_file_id=json_id)
+        accessibility = await _read_accessibility_counts(json_file_id=json_id, department_id=department_id)
     return PipelineRunFileItem(
         name=row.file_name,
         status=row.status,
@@ -155,12 +184,14 @@ def _derive_output_stem(file_name: str) -> str:
     return file_name
 
 
-async def _build_output_catalog(db: AsyncSession) -> tuple[dict[str, str], dict[str, dict[str, str]]]:
+async def _build_output_catalog(db: AsyncSession, department_id: str) -> tuple[dict[str, str], dict[str, dict[str, str]]]:
     auth_service = MicrosoftAuthService()
     onedrive_client = OneDriveClient()
+    cfg = (await db.execute(select(DepartmentConfig).where(DepartmentConfig.department_id == department_id))).scalars().first()
+    output_folder = cfg.output_success_folder if cfg else "AdobePipeline/output/success"
     try:
-        access_token = await auth_service.get_valid_access_token(db=db)
-        files = await onedrive_client.list_files(access_token=access_token, folder_path=OUTPUT_SUCCESS_FOLDER)
+        access_token = await auth_service.get_valid_token_for_dept(db, department_id)
+        files = await onedrive_client.list_files(access_token=access_token, folder_path=output_folder)
         lookup = {item.get("name", ""): item.get("id", "") for item in files if item.get("name") and item.get("id")}
         grouped: dict[str, dict[str, str]] = {}
         for item in files:
@@ -200,19 +231,17 @@ def _resolve_output_id(output_lookup: dict[str, str], stem: str, candidates: lis
         file_id = output_lookup.get(name, "")
         if file_id:
             return file_id
-    # Intentionally no substring fuzzy match: short stems (and substrings like "report")
-    # incorrectly resolve to the first OneDrive output and duplicate accessibility counts.
     return ""
 
 
-async def _read_accessibility_counts(json_file_id: str) -> dict[str, int]:
+async def _read_accessibility_counts(json_file_id: str, department_id: str) -> dict[str, int]:
     if not json_file_id:
         return {"passed": 0, "failed": 0, "manual": 0}
     async for db in get_db():
         try:
             auth_service = MicrosoftAuthService()
             onedrive_client = OneDriveClient()
-            access_token = await auth_service.get_valid_access_token(db=db)
+            access_token = await auth_service.get_valid_token_for_dept(db, department_id)
             content = await onedrive_client.get_file_content(access_token=access_token, file_id=json_file_id)
             payload = json.loads(content.decode("utf-8"))
             summary = payload.get("Summary") if isinstance(payload, dict) else {}

@@ -1,35 +1,36 @@
 import json
 import logging
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import JSONResponse, StreamingResponse
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.database import get_db
+from app.db.models import DepartmentConfig
+from app.services.auth.app_auth import CurrentUser, require_dept_user
 from app.services.auth.microsoft_auth import MicrosoftAuthError, MicrosoftAuthService
-from app.services.storage.onedrive import (
-    INTAKE_FOLDER,
-    PROCESSED_FOLDER,
-    OUTPUT_SUCCESS_FOLDER,
-    OUTPUT_FAILURE_FOLDER,
-    OneDriveClient,
-    OneDriveError,
-    OneDriveNotFoundError,
-)
+from app.services.storage.onedrive import OneDriveClient, OneDriveError, OneDriveNotFoundError
 
 router = APIRouter(tags=["files"])
 logger = logging.getLogger(__name__)
 
-FOLDER_MAP = {
-    "intake": INTAKE_FOLDER,
-    "processed": PROCESSED_FOLDER,
-    "output/success": OUTPUT_SUCCESS_FOLDER,
-    "output/failure": OUTPUT_FAILURE_FOLDER,
-}
+
+async def _folder_map(db: AsyncSession, department_id: str) -> dict[str, str]:
+    cfg = (await db.execute(select(DepartmentConfig).where(DepartmentConfig.department_id == department_id))).scalars().first()
+    if not cfg:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Department configuration not found.")
+    return {
+        "intake": cfg.intake_folder,
+        "processed": cfg.processed_folder,
+        "output/success": cfg.output_success_folder,
+        "output/failure": cfg.output_failure_folder,
+    }
 
 
-def _resolve_folder(folder: str) -> str:
-    resolved = FOLDER_MAP.get(folder.lower())
+def _resolve_folder(folder_map: dict[str, str], folder: str) -> str:
+    resolved = folder_map.get(folder.lower())
     if not resolved:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -39,13 +40,18 @@ def _resolve_folder(folder: str) -> str:
 
 
 @router.get("/files")
-async def list_files(folder: str = Query(...), db: AsyncSession = Depends(get_db)) -> list[dict]:
-    folder_path = _resolve_folder(folder)
+async def list_files(
+    user: Annotated[CurrentUser, Depends(require_dept_user)],
+    folder: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+) -> list[dict]:
+    folder_map = await _folder_map(db, user.department_id)
+    folder_path = _resolve_folder(folder_map, folder)
     logger.info("Files API listing OneDrive folder: folder=%s mapped_path=%s", folder, folder_path)
     auth_service = MicrosoftAuthService()
     onedrive_client = OneDriveClient()
     try:
-        access_token = await auth_service.get_valid_access_token(db=db)
+        access_token = await auth_service.get_valid_token_for_dept(db, user.department_id)
         files = await onedrive_client.list_files(access_token=access_token, folder_path=folder_path)
     except MicrosoftAuthError as exc:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc)) from exc
@@ -71,11 +77,15 @@ async def list_files(folder: str = Query(...), db: AsyncSession = Depends(get_db
 
 
 @router.get("/file-content")
-async def get_file_content(file_id: str = Query(..., alias="id"), db: AsyncSession = Depends(get_db)):
+async def get_file_content(
+    user: Annotated[CurrentUser, Depends(require_dept_user)],
+    file_id: str = Query(..., alias="id"),
+    db: AsyncSession = Depends(get_db),
+):
     auth_service = MicrosoftAuthService()
     onedrive_client = OneDriveClient()
     try:
-        access_token = await auth_service.get_valid_access_token(db=db)
+        access_token = await auth_service.get_valid_token_for_dept(db, user.department_id)
         metadata = await onedrive_client.get_item_metadata(access_token=access_token, file_id=file_id)
         mime_type = metadata.get("file", {}).get("mimeType", "application/octet-stream")
         filename = metadata.get("name", "download")
@@ -98,11 +108,15 @@ async def get_file_content(file_id: str = Query(..., alias="id"), db: AsyncSessi
 
 
 @router.get("/file-preview-pdf")
-async def get_file_preview_pdf(file_id: str = Query(..., alias="id"), db: AsyncSession = Depends(get_db)):
+async def get_file_preview_pdf(
+    user: Annotated[CurrentUser, Depends(require_dept_user)],
+    file_id: str = Query(..., alias="id"),
+    db: AsyncSession = Depends(get_db),
+):
     auth_service = MicrosoftAuthService()
     onedrive_client = OneDriveClient()
     try:
-        access_token = await auth_service.get_valid_access_token(db=db)
+        access_token = await auth_service.get_valid_token_for_dept(db, user.department_id)
         metadata = await onedrive_client.get_item_metadata(access_token=access_token, file_id=file_id)
         filename = metadata.get("name", "document")
         mime_type = metadata.get("file", {}).get("mimeType", "application/octet-stream")

@@ -1,58 +1,82 @@
 import React, { useEffect, useState } from "react";
 
-import MicrosoftLogin from "./components/MicrosoftLogin";
+import Login from "./pages/Login";
+import AdminPanel from "./pages/AdminPanel";
 import Dashboard from "./pages/Dashboard";
-import { getAuthStatus } from "./services/api";
+import { getAppJwt, parseJwtPayload } from "./services/api";
 
-function App() {
-  const [isAuthenticated, setIsAuthenticated] = useState(false);
-  const [isLoading, setIsLoading] = useState(true);
+function usePathname() {
+  const [pathname, setPathname] = useState(() =>
+    typeof window !== "undefined" ? window.location.pathname : "/login"
+  );
 
   useEffect(() => {
-    const fetchAuthStatus = async () => {
-      try {
-        const status = await getAuthStatus();
-        setIsAuthenticated(Boolean(status?.authenticated));
-      } catch {
-        setIsAuthenticated(false);
-      } finally {
-        setIsLoading(false);
-      }
-    };
-    fetchAuthStatus();
+    const sync = () => setPathname(window.location.pathname);
+    window.addEventListener("popstate", sync);
+    return () => window.removeEventListener("popstate", sync);
   }, []);
 
   useEffect(() => {
-    if (isLoading) {
-      return;
-    }
-    if (isAuthenticated && window.location.pathname !== "/dashboard") {
-      window.history.replaceState({}, "", "/dashboard");
-    }
-    if (!isAuthenticated && window.location.pathname !== "/") {
-      window.history.replaceState({}, "", "/");
-    }
-  }, [isAuthenticated, isLoading]);
+    if (pathname !== "/" || typeof window === "undefined") return;
+    const token = getAppJwt();
+    const payload = parseJwtPayload(token);
+    const dest = !token ? "/login" : payload?.role === "super_admin" ? "/admin" : "/dashboard";
+    window.history.replaceState({}, "", dest);
+    setPathname(dest);
+  }, [pathname]);
 
-  if (isLoading) {
-    return (
-      <div className="h-screen flex items-center justify-center bg-gray-100">
-        <div className="text-gray-600">Loading...</div>
-      </div>
-    );
-  }
+  return pathname;
+}
 
-  if (!isAuthenticated) {
-    return (
-      <div className="h-screen flex items-center justify-center bg-gray-100">
-        <MicrosoftLogin />
-      </div>
-    );
-  }
-
+function Redirecting({ to }) {
+  useEffect(() => {
+    window.location.replace(to);
+  }, [to]);
   return (
-    <Dashboard />
+    <div className="h-screen flex items-center justify-center bg-gray-100">
+      <div className="text-gray-600 text-sm">Redirecting…</div>
+    </div>
   );
 }
 
-export default App;
+export default function App() {
+  const pathname = usePathname();
+  const token = getAppJwt();
+  const payload = parseJwtPayload(token);
+
+  if (pathname === "/login") {
+    return <Login />;
+  }
+
+  if (!token) {
+    return <Redirecting to="/login" />;
+  }
+
+  if (pathname === "/admin") {
+    if (payload?.role !== "super_admin") {
+      return <Redirecting to="/login" />;
+    }
+    return <AdminPanel />;
+  }
+
+  if (pathname === "/dept-settings") {
+    if (payload?.role !== "dept_user") {
+      return <Redirecting to="/login" />;
+    }
+    return <Dashboard initialActivePage="dept-settings" />;
+  }
+
+  if (pathname === "/dashboard") {
+    if (payload?.role === "super_admin") {
+      return <Redirecting to="/admin" />;
+    }
+    if (payload?.role !== "dept_user") {
+      return <Redirecting to="/login" />;
+    }
+    return <Dashboard />;
+  }
+
+  const fallback =
+    payload?.role === "super_admin" ? "/admin" : payload?.role === "dept_user" ? "/dashboard" : "/login";
+  return <Redirecting to={fallback} />;
+}

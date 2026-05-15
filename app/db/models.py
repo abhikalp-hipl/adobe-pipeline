@@ -2,7 +2,7 @@ import enum
 import uuid
 from datetime import date, datetime
 
-from sqlalchemy import Boolean, Date, DateTime, Enum, ForeignKey, Integer, String
+from sqlalchemy import Boolean, Date, DateTime, Enum, ForeignKey, Integer, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.database import Base
@@ -22,6 +22,164 @@ class PipelineRunStatus(str, enum.Enum):
     FAILED = "FAILED"
 
 
+class Department(Base):
+    __tablename__ = "departments"
+
+    id: Mapped[str] = mapped_column(
+        String(36),
+        primary_key=True,
+        default=lambda: str(uuid.uuid4()),
+    )
+    name: Mapped[str] = mapped_column(String(256), nullable=False)
+    # Designated department admin (Microsoft / notifications); must be one of distribution emails when set.
+    admin_email: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=datetime.utcnow,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+    )
+
+    config: Mapped["DepartmentConfig | None"] = relationship(
+        back_populates="department",
+        uselist=False,
+        cascade="all, delete-orphan",
+    )
+    credentials: Mapped["DepartmentCredentials | None"] = relationship(
+        back_populates="department",
+        uselist=False,
+        cascade="all, delete-orphan",
+    )
+    oauth_token: Mapped["DepartmentOAuthToken | None"] = relationship(
+        back_populates="department",
+        uselist=False,
+        cascade="all, delete-orphan",
+    )
+    email_members: Mapped[list["DepartmentEmailMember"]] = relationship(
+        back_populates="department",
+        cascade="all, delete-orphan",
+    )
+
+
+class DepartmentConfig(Base):
+    __tablename__ = "department_configs"
+    __table_args__ = (UniqueConstraint("department_id", name="uq_department_config_dept"),)
+
+    id: Mapped[str] = mapped_column(
+        String(36),
+        primary_key=True,
+        default=lambda: str(uuid.uuid4()),
+    )
+    department_id: Mapped[str] = mapped_column(String(36), ForeignKey("departments.id"), nullable=False)
+    schedule_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    schedule_time: Mapped[str] = mapped_column(String(5), nullable=False, default="09:00")
+    intake_folder: Mapped[str] = mapped_column(String(512), nullable=False, default="AdobePipeline/intake")
+    processed_folder: Mapped[str] = mapped_column(String(512), nullable=False, default="AdobePipeline/processed")
+    output_success_folder: Mapped[str] = mapped_column(
+        String(512), nullable=False, default="AdobePipeline/output/success"
+    )
+    output_failure_folder: Mapped[str] = mapped_column(
+        String(512), nullable=False, default="AdobePipeline/output/failure"
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+    )
+
+    department: Mapped["Department"] = relationship(back_populates="config")
+
+
+class DepartmentCredentials(Base):
+    __tablename__ = "department_credentials"
+    __table_args__ = (UniqueConstraint("department_id", name="uq_department_credentials_dept"),)
+
+    id: Mapped[str] = mapped_column(
+        String(36),
+        primary_key=True,
+        default=lambda: str(uuid.uuid4()),
+    )
+    department_id: Mapped[str] = mapped_column(String(36), ForeignKey("departments.id"), nullable=False)
+    username: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    password_hash: Mapped[str] = mapped_column(String(256), nullable=False)
+
+    department: Mapped["Department"] = relationship(back_populates="credentials")
+
+
+class DepartmentOAuthToken(Base):
+    __tablename__ = "department_oauth_tokens"
+    __table_args__ = (UniqueConstraint("department_id", name="uq_department_oauth_dept"),)
+
+    id: Mapped[str] = mapped_column(
+        String(36),
+        primary_key=True,
+        default=lambda: str(uuid.uuid4()),
+    )
+    department_id: Mapped[str] = mapped_column(String(36), ForeignKey("departments.id"), nullable=False)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False, default="microsoft")
+    connected_email: Mapped[str] = mapped_column(String(320), nullable=False, default="")
+    tenant_id: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    access_token: Mapped[str] = mapped_column(String, nullable=False)
+    refresh_token: Mapped[str] = mapped_column(String, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=datetime.utcnow,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+    )
+
+    department: Mapped["Department"] = relationship(back_populates="oauth_token")
+
+
+class DepartmentEmailMember(Base):
+    __tablename__ = "department_email_members"
+    __table_args__ = (UniqueConstraint("department_id", "email", name="uq_department_email_member"),)
+
+    id: Mapped[str] = mapped_column(
+        String(36),
+        primary_key=True,
+        default=lambda: str(uuid.uuid4()),
+    )
+    department_id: Mapped[str] = mapped_column(String(36), ForeignKey("departments.id"), nullable=False, index=True)
+    email: Mapped[str] = mapped_column(String(320), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=datetime.utcnow,
+    )
+
+    department: Mapped["Department"] = relationship(back_populates="email_members")
+
+
+class SuperAdmin(Base):
+    __tablename__ = "super_admins"
+
+    id: Mapped[str] = mapped_column(
+        String(36),
+        primary_key=True,
+        default=lambda: str(uuid.uuid4()),
+    )
+    username: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    password_hash: Mapped[str] = mapped_column(String(256), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=datetime.utcnow,
+    )
+
+
 class Document(Base):
     __tablename__ = "documents"
 
@@ -30,6 +188,7 @@ class Document(Base):
         primary_key=True,
         default=lambda: str(uuid.uuid4()),
     )
+    department_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("departments.id"), nullable=True, index=True)
     filename: Mapped[str] = mapped_column(String(512), nullable=False, unique=True)
     status: Mapped[DocumentStatus] = mapped_column(
         Enum(DocumentStatus),
@@ -100,6 +259,7 @@ class PipelineRun(Base):
         primary_key=True,
         default=lambda: str(uuid.uuid4()),
     )
+    department_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("departments.id"), nullable=True, index=True)
     run_id: Mapped[str] = mapped_column(String(36), nullable=False, unique=True)
     start_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     end_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -156,6 +316,7 @@ class NotificationSettings(Base):
         primary_key=True,
         default=lambda: str(uuid.uuid4()),
     )
+    department_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("departments.id"), nullable=True, index=True)
     eod_time: Mapped[str] = mapped_column(String(5), nullable=False, default="18:00")
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     scheduler_interval_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=300)

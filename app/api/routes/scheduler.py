@@ -1,9 +1,12 @@
-from fastapi import APIRouter, HTTPException, Request, status
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 
 from app.db.database import SessionLocal
 from app.db.models import NotificationSettings
+from app.services.auth.app_auth import CurrentUser, require_dept_user
 from app.services.scheduler import Scheduler
 
 router = APIRouter(prefix="/scheduler", tags=["scheduler"])
@@ -49,6 +52,7 @@ async def get_scheduler_status(request: Request) -> SchedulerStatusResponse:
 async def update_scheduler_interval(
     payload: SchedulerIntervalUpdateRequest,
     request: Request,
+    user: Annotated[CurrentUser, Depends(require_dept_user)],
 ) -> SchedulerStatusResponse:
     scheduler = _get_scheduler(request=request)
     if not scheduler.automation_enabled:
@@ -57,7 +61,7 @@ async def update_scheduler_interval(
             detail="Scheduler interval updates are disabled for OneDrive delegated mode.",
         )
     scheduler.update_interval(new_interval=payload.interval)
-    await _persist_scheduler_interval(new_interval=payload.interval)
+    await _persist_scheduler_interval(new_interval=payload.interval, department_id=user.department_id)
     return SchedulerStatusResponse(
         interval=scheduler.interval,
         status=scheduler.status(),
@@ -67,20 +71,29 @@ async def update_scheduler_interval(
 
 
 @router.post("/run-now", response_model=RunNowResponse)
-async def run_scheduler_now(request: Request) -> RunNowResponse:
+async def run_scheduler_now(
+    request: Request,
+    user: Annotated[CurrentUser, Depends(require_dept_user)],
+) -> RunNowResponse:
     scheduler = _get_scheduler(request=request)
-    await scheduler.run_once()
+    await scheduler.run_once(department_id=user.department_id)
     return RunNowResponse(detail="Processing started")
 
 
-async def _persist_scheduler_interval(new_interval: int) -> None:
+async def _persist_scheduler_interval(new_interval: int, department_id: str | None) -> None:
     async with SessionLocal() as db:
-        settings_row = (await db.execute(select(NotificationSettings).order_by(NotificationSettings.created_at.asc()))).scalars().first()
+        if department_id:
+            settings_row = (
+                await db.execute(select(NotificationSettings).where(NotificationSettings.department_id == department_id))
+            ).scalars().first()
+        else:
+            settings_row = (await db.execute(select(NotificationSettings).order_by(NotificationSettings.created_at.asc()))).scalars().first()
         if not settings_row:
             settings_row = NotificationSettings(
                 eod_time="18:00",
                 enabled=False,
                 scheduler_interval_seconds=new_interval,
+                department_id=department_id,
             )
         else:
             settings_row.scheduler_interval_seconds = new_interval

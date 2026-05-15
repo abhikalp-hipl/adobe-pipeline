@@ -10,7 +10,7 @@ from collections import Counter
 from typing import Callable
 
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy import func, select
+from sqlalchemy import func, select, and_
 from openpyxl import Workbook
 
 from datetime import date, datetime, UTC
@@ -19,6 +19,10 @@ from datetime import timedelta
 from app.core.config import settings
 from app.db.database import SessionLocal
 from app.db.models import (
+    Department,
+    DepartmentConfig,
+    DepartmentEmailMember,
+    DepartmentOAuthToken,
     Document,
     DocumentStatus,
     EmailGroup,
@@ -76,7 +80,7 @@ class Scheduler:
         self.last_failure: dict | None = None
         self._status_listener = status_listener
         self._status_lock = threading.Lock()
-        self._onedrive_folders_ensured = False
+        self._ensured_dept_folders: set[str] = set()
         self.pipeline_status: dict[str, object] = {
             "is_running": False,
             "current_step": None,
@@ -180,12 +184,46 @@ class Scheduler:
         # Wake the scheduler loop so the new interval takes effect immediately.
         self._wakeup_event.set()
 
-    async def run_once(self) -> None:
+    async def run_once(self, *, department_id: str | None = None) -> None:
+        if self.storage_provider == "onedrive":
+            if department_id:
+                async with SessionLocal() as db:
+                    tok = (
+                        await db.execute(
+                            select(DepartmentOAuthToken).where(
+                                DepartmentOAuthToken.department_id == department_id
+                            )
+                        )
+                    ).scalars().first()
+                if not tok:
+                    logger.warning(
+                        "Manual run skipped: department_id=%s has no Microsoft OAuth connected.",
+                        department_id,
+                    )
+                    self._mark_pipeline_started()
+                    self._mark_pipeline_finished(success=True)
+                    return
+                await self._run_pipeline_for_department(department_id=department_id)
+                return
+
+            async with SessionLocal() as db:
+                dept_ids = list((await db.execute(select(DepartmentOAuthToken.department_id))).scalars().all())
+            if not dept_ids:
+                logger.warning("No departments with Microsoft OAuth connected; scheduler run skipped.")
+                self._mark_pipeline_started()
+                self._mark_pipeline_finished(success=True)
+                return
+            for dept_id in dept_ids:
+                await self._run_pipeline_for_department(department_id=dept_id)
+            return
+        await self._run_pipeline_for_department(department_id=department_id)
+
+    async def _run_pipeline_for_department(self, department_id: str | None) -> bool:
         self._mark_pipeline_started()
         run_id = str(uuid.uuid4())
         started_at = datetime.now(UTC)
-        logger.info("Manual scheduler run started: run_id=%s", run_id)
-        run_db_id = await self._create_pipeline_run(run_id=run_id, start_time=started_at)
+        logger.info("Manual scheduler run started: run_id=%s department_id=%s", run_id, department_id or "n/a")
+        run_db_id = await self._create_pipeline_run(run_id=run_id, start_time=started_at, department_id=department_id)
 
         files_summary: list[dict[str, object]] = []
         access_passed = 0
@@ -197,7 +235,7 @@ class Scheduler:
         run_failed = False
 
         try:
-            run_result = await self._drain_intake_for_run()
+            run_result = await self._drain_intake_for_run(department_id=department_id)
             files_summary = run_result.get("files", [])
             access = run_result.get("accessibility", {})
             access_passed = int(access.get("passed", 0))
@@ -246,7 +284,7 @@ class Scheduler:
             }
 
             try:
-                recipient_emails = await self._get_notification_emails()
+                recipient_emails = await self._get_notification_emails(department_id=department_id)
                 if not recipient_emails:
                     logger.info("Skipping email notification (no configured recipients): run_id=%s", run_id)
                 else:
@@ -269,6 +307,8 @@ class Scheduler:
 
             self._mark_pipeline_finished(success=not run_failed)
             logger.info("Manual scheduler run finished: run_id=%s duration=%s", run_id, duration)
+
+        return run_failed
 
     def _run_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -364,7 +404,7 @@ class Scheduler:
             "accessibility": {"passed": access_passed, "failed": access_failed, "manual": access_manual},
         }
 
-    async def _drain_intake_for_run(self) -> dict[str, object]:
+    async def _drain_intake_for_run(self, department_id: str | None = None) -> dict[str, object]:
         files_summary: list[dict[str, object]] = []
         total_processed = 0
         total_failed = 0
@@ -377,7 +417,7 @@ class Scheduler:
         while cycle_number < self.max_cycles_per_run:
             cycle_number += 1
             if self.storage_provider == "onedrive":
-                cycle_result = await self.process_onedrive_intake()
+                cycle_result = await self.process_onedrive_intake(department_id=department_id)
             elif self.storage_provider == "local":
                 cycle_result = self._poll_local_intake_folder()
             else:
@@ -431,26 +471,73 @@ class Scheduler:
             "accessibility": {"passed": access_passed, "failed": access_failed, "manual": access_manual},
         }
 
-    async def process_onedrive_intake(self) -> dict:
+    async def process_onedrive_intake(self, department_id: str | None = None) -> dict:
         if not self.onedrive_client:
             raise OneDriveError("OneDrive client is not initialized.")
         if not self.auth_service:
             raise MicrosoftAuthError("Microsoft auth service is not initialized.")
 
-        if not self._onedrive_folders_ensured:
+        if department_id is not None:
+            return await self._process_onedrive_intake_for_department(department_id)
+
+        async with SessionLocal() as db:
+            dept_ids = list((await db.execute(select(DepartmentOAuthToken.department_id))).scalars().all())
+        merged: dict[str, object] = {
+            "processed": 0,
+            "skipped": 0,
+            "failed": 0,
+            "files": [],
+            "accessibility": {"passed": 0, "failed": 0, "manual": 0},
+        }
+        for did in dept_ids:
+            part = await self._process_onedrive_intake_for_department(did)
+            merged["processed"] = int(merged["processed"]) + int(part.get("processed", 0))
+            merged["skipped"] = int(merged["skipped"]) + int(part.get("skipped", 0))
+            merged["failed"] = int(merged["failed"]) + int(part.get("failed", 0))
+            merged["files"] = list(merged["files"]) + list(part.get("files", []))
+            acc = part.get("accessibility") or {}
+            macc = merged["accessibility"] if isinstance(merged["accessibility"], dict) else {}
+            merged["accessibility"] = {
+                "passed": int(macc.get("passed", 0)) + int(acc.get("passed", 0)),
+                "failed": int(macc.get("failed", 0)) + int(acc.get("failed", 0)),
+                "manual": int(macc.get("manual", 0)) + int(acc.get("manual", 0)),
+            }
+        return merged
+
+    async def _process_onedrive_intake_for_department(self, department_id: str) -> dict:
+        async with SessionLocal() as db:
+            cfg = (await db.execute(select(DepartmentConfig).where(DepartmentConfig.department_id == department_id))).scalars().first()
+            if not cfg:
+                raise OneDriveError(f"Missing department config for department_id={department_id}")
+            intake_folder = cfg.intake_folder
+            processed_folder = cfg.processed_folder
+            output_success_folder = cfg.output_success_folder
+            output_failure_folder = cfg.output_failure_folder
+            access_token = await self.auth_service.get_valid_token_for_dept(db, department_id)
+
+        if department_id not in self._ensured_dept_folders:
             try:
-                await ensure_pipeline_folders(await self._get_onedrive_access_token())
-                self._onedrive_folders_ensured = True
+                await ensure_pipeline_folders(
+                    access_token,
+                    intake_folder=intake_folder,
+                    processed_folder=processed_folder,
+                    output_success_folder=output_success_folder,
+                    output_failure_folder=output_failure_folder,
+                )
+                self._ensured_dept_folders.add(department_id)
             except Exception:
                 logger.exception("Failed to ensure required OneDrive pipeline folders before intake processing.")
 
+        async with SessionLocal() as db:
+            access_token = await self.auth_service.get_valid_token_for_dept(db, department_id)
+
         try:
             all_files = await self.onedrive_client.list_files(
-                access_token=await self._get_onedrive_access_token(),
-                folder_path=INTAKE_FOLDER,
+                access_token=access_token,
+                folder_path=intake_folder,
             )
         except (OneDriveError, MicrosoftAuthError):
-            logger.exception("Scheduler failed to list OneDrive intake folder: folder=%s", INTAKE_FOLDER)
+            logger.exception("Scheduler failed to list OneDrive intake folder: folder=%s", intake_folder)
             raise
 
         candidate_files: list[dict[str, str]] = []
@@ -465,16 +552,17 @@ class Scheduler:
             elif reason == "invalid":
                 logger.info("Scheduler skipped invalid OneDrive file: filename=%s file_id=%s", filename, remote_file["id"])
 
-        # Apply max_files_per_cycle to files that are not already known in DB,
-        # so previously processed files do not consume the current run capacity.
         async with SessionLocal() as db:
             candidate_source_ids = [item["id"] for item in candidate_files]
             existing_source_ids: set[str] = set()
             if candidate_source_ids:
                 existing_rows = (
-                    await db.execute(select(Document.filename).where(Document.filename.in_(candidate_source_ids)))
-                )
-                existing_rows = existing_rows.all()
+                    await db.execute(
+                        select(Document.filename).where(
+                            and_(Document.filename.in_(candidate_source_ids), Document.department_id == department_id)
+                        )
+                    )
+                ).all()
                 existing_source_ids = {row[0] for row in existing_rows}
 
         process_batch = []
@@ -485,7 +573,8 @@ class Scheduler:
             if len(process_batch) >= self.max_files_per_cycle:
                 break
         logger.info(
-            "OneDrive intake batch prepared: candidates=%d unprocessed=%d processing_now=%d deferred=%d max_per_cycle=%d",
+            "OneDrive intake batch prepared: department_id=%s candidates=%d unprocessed=%d processing_now=%d deferred=%d max_per_cycle=%d",
+            department_id,
             len(candidate_files),
             max(0, len(candidate_files) - len(existing_source_ids)),
             len(process_batch),
@@ -509,10 +598,12 @@ class Scheduler:
                 progress=int((index / total_files) * 100),
             )
             try:
+                async with SessionLocal() as db:
+                    dl_token = await self.auth_service.get_valid_token_for_dept(db, department_id)
                 with tempfile.TemporaryDirectory(prefix="onedrive-intake-") as temp_dir:
                     local_path = Path(temp_dir) / f"{file_id}_{filename}"
                     await self.onedrive_client.download_file(
-                        access_token=await self._get_onedrive_access_token(),
+                        access_token=dl_token,
                         file_id=file_id,
                         local_path=local_path,
                     )
@@ -521,6 +612,10 @@ class Scheduler:
                         file_path=local_path,
                         source_id=file_id,
                         original_filename=filename,
+                        department_id=department_id,
+                        processed_folder=processed_folder,
+                        output_success_folder=output_success_folder,
+                        output_failure_folder=output_failure_folder,
                     )
                 if result:
                     processed_count += 1
@@ -687,11 +782,22 @@ class Scheduler:
         file_path: Path,
         source_id: str,
         original_filename: str,
+        *,
+        department_id: str,
+        processed_folder: str,
+        output_success_folder: str,
+        output_failure_folder: str,
     ) -> dict[str, str] | None:
         document: Document | None = None
         async with SessionLocal() as db:
             try:
-                existing = (await db.execute(select(Document).where(Document.filename == source_id))).scalars().first()
+                existing = (
+                    await db.execute(
+                        select(Document).where(
+                            and_(Document.filename == source_id, Document.department_id == department_id),
+                        )
+                    )
+                ).scalars().first()
                 if existing:
                     logger.info(
                         "Skipping file because it was already processed: filename=%s source_id=%s document_id=%s. Action required: rename the file or upload a different file.",
@@ -706,7 +812,7 @@ class Scheduler:
                         "report_path": "",
                     }
 
-                document = Document(filename=source_id, status=DocumentStatus.UPLOADED)
+                document = Document(filename=source_id, status=DocumentStatus.UPLOADED, department_id=department_id)
                 db.add(document)
                 await db.commit()
                 await db.refresh(document)
@@ -717,12 +823,13 @@ class Scheduler:
                     original_filename,
                 )
 
+                access_token = await self.auth_service.get_valid_token_for_dept(db, department_id)
                 orchestrator = Orchestrator(db=db)
                 result = await orchestrator.process_document(document_id=document.id, input_path=file_path)
                 await self.onedrive_client.move_file(
-                    access_token=await self._get_onedrive_access_token(),
+                    access_token=access_token,
                     file_id=source_id,
-                    folder_path=PROCESSED_FOLDER,
+                    folder_path=processed_folder,
                     filename=original_filename,
                 )
                 logger.info("OneDrive original moved to processed: file_id=%s filename=%s", source_id, original_filename)
@@ -730,6 +837,8 @@ class Scheduler:
                     tagged_pdf_path=result["tagged_pdf_path"],
                     report_path=result["report_path"],
                     autotag_report_path=result.get("autotag_report_path"),
+                    department_id=department_id,
+                    output_success_folder=output_success_folder,
                 )
                 report_path = str(result.get("report_path") or "")
                 summary = self._read_accessibility_summary(report_path) if report_path else {"passed": 0, "failed": 0, "manual": 0}
@@ -748,10 +857,12 @@ class Scheduler:
             except OrchestratorError as exc:
                 logger.exception("Processing failed for OneDrive file: source_id=%s filename=%s", source_id, original_filename)
                 try:
+                    async with SessionLocal() as db_fail:
+                        fail_token = await self.auth_service.get_valid_token_for_dept(db_fail, department_id)
                     await self.onedrive_client.move_file(
-                        access_token=await self._get_onedrive_access_token(),
+                        access_token=fail_token,
                         file_id=source_id,
-                        folder_path=OUTPUT_FAILURE_FOLDER,
+                        folder_path=output_failure_folder,
                         filename=original_filename,
                     )
                     logger.info("OneDrive original moved to failure: file_id=%s filename=%s", source_id, original_filename)
@@ -829,22 +940,31 @@ class Scheduler:
             return {"passed": 0, "failed": 0, "manual": 0}
 
     @staticmethod
-    async def _get_notification_emails() -> list[str]:
+    async def _get_notification_emails(department_id: str | None) -> list[str]:
         async with SessionLocal() as db:
-            try:
+            if department_id:
+                rows = (
+                    await db.execute(
+                        select(DepartmentEmailMember.email)
+                        .where(DepartmentEmailMember.department_id == department_id)
+                        .order_by(DepartmentEmailMember.created_at.asc())
+                    )
+                ).all()
+            else:
                 rows = (await db.execute(select(EmailGroup.email).order_by(EmailGroup.created_at.asc()))).all()
-                emails = [row[0].strip().lower() for row in rows if row and row[0]]
-                deduped = list(dict.fromkeys(emails))
-                return deduped
-            except Exception:
-                logger.exception("Failed to resolve notification email list")
-                return []
+            emails = [row[0].strip().lower() for row in rows if row and row[0]]
+            return list(dict.fromkeys(emails))
 
     @staticmethod
-    async def _create_pipeline_run(run_id: str, start_time: datetime) -> str:
+    async def _create_pipeline_run(run_id: str, start_time: datetime, department_id: str | None = None) -> str:
         async with SessionLocal() as db:
             try:
-                row = PipelineRun(run_id=run_id, start_time=start_time, status=PipelineRunStatus.COMPLETED)
+                row = PipelineRun(
+                    run_id=run_id,
+                    start_time=start_time,
+                    status=PipelineRunStatus.COMPLETED,
+                    department_id=department_id,
+                )
                 db.add(row)
                 await db.commit()
                 await db.refresh(row)
@@ -940,11 +1060,13 @@ class Scheduler:
 
                 day_start = datetime.combine(today, datetime.min.time())
                 day_end = day_start + timedelta(days=1)
+                dept_scope = getattr(settings_row, "department_id", None)
+                run_base_filters = [PipelineRun.created_at >= day_start, PipelineRun.created_at < day_end]
+                if dept_scope:
+                    run_base_filters.append(PipelineRun.department_id == dept_scope)
                 runs = (
                     await db.execute(
-                        select(PipelineRun)
-                        .where(PipelineRun.created_at >= day_start, PipelineRun.created_at < day_end)
-                        .order_by(PipelineRun.start_time.asc())
+                        select(PipelineRun).where(*run_base_filters).order_by(PipelineRun.start_time.asc())
                     )
                 ).scalars().all()
                 total_runs = len(runs)
@@ -971,10 +1093,7 @@ class Scheduler:
                     await db.execute(
                         select(PipelineRun.run_id, PipelineRunFile)
                         .join(PipelineRun, PipelineRun.id == PipelineRunFile.run_id)
-                        .where(
-                            PipelineRun.created_at >= day_start,
-                            PipelineRun.created_at < day_end,
-                        )
+                        .where(*run_base_filters)
                         .order_by(PipelineRun.start_time.asc(), PipelineRunFile.created_at.asc())
                     )
                 ).all()
@@ -998,8 +1117,7 @@ class Scheduler:
                         select(PipelineRunFile.error_message, func.count(PipelineRunFile.id))
                         .join(PipelineRun, PipelineRun.id == PipelineRunFile.run_id)
                         .where(
-                            PipelineRun.created_at >= day_start,
-                            PipelineRun.created_at < day_end,
+                            *run_base_filters,
                             PipelineRunFile.status == PipelineRunStatus.FAILED,
                             PipelineRunFile.error_message != "",
                         )
@@ -1040,7 +1158,7 @@ class Scheduler:
                         "failed_files": total_failed_files,
                     },
                 )
-                recipients = await self._get_notification_emails()
+                recipients = await Scheduler._get_notification_emails(department_id=dept_scope)
                 if not recipients:
                     logger.info("Skipping EOD summary email: no recipients")
                 else:
@@ -1141,42 +1259,55 @@ class Scheduler:
         tagged_pdf_path: str,
         report_path: str,
         autotag_report_path: str | None = None,
+        *,
+        department_id: str | None = None,
+        output_success_folder: str | None = None,
     ) -> None:
         if not self.onedrive_client:
             raise OneDriveError("OneDrive client is not initialized for upload.")
 
+        target_folder = output_success_folder or OUTPUT_SUCCESS_FOLDER
         tagged_path_obj = Path(tagged_pdf_path)
         report_path_obj = Path(report_path)
+        async with SessionLocal() as db:
+            if department_id:
+                access_token = await self.auth_service.get_valid_token_for_dept(db, department_id)
+            else:
+                access_token = await self.auth_service.get_valid_access_token(db=db)
         await self.onedrive_client.upload_file(
-            access_token=await self._get_onedrive_access_token(),
+            access_token=access_token,
             local_path=tagged_path_obj,
-            folder_path=OUTPUT_SUCCESS_FOLDER,
+            folder_path=target_folder,
             filename=tagged_path_obj.name,
         )
-        logger.info("Upload success to OneDrive: local=%s target_folder=%s", tagged_path_obj, OUTPUT_SUCCESS_FOLDER)
+        logger.info("Upload success to OneDrive: local=%s target_folder=%s", tagged_path_obj, target_folder)
+        async with SessionLocal() as db:
+            if department_id:
+                access_token = await self.auth_service.get_valid_token_for_dept(db, department_id)
+            else:
+                access_token = await self.auth_service.get_valid_access_token(db=db)
         await self.onedrive_client.upload_file(
-            access_token=await self._get_onedrive_access_token(),
+            access_token=access_token,
             local_path=report_path_obj,
-            folder_path=OUTPUT_SUCCESS_FOLDER,
+            folder_path=target_folder,
             filename=report_path_obj.name,
         )
-        logger.info("Upload success to OneDrive: local=%s target_folder=%s", report_path_obj, OUTPUT_SUCCESS_FOLDER)
+        logger.info("Upload success to OneDrive: local=%s target_folder=%s", report_path_obj, target_folder)
         if autotag_report_path:
             autotag_report_obj = Path(autotag_report_path)
             if autotag_report_obj.exists():
+                async with SessionLocal() as db:
+                    if department_id:
+                        access_token = await self.auth_service.get_valid_token_for_dept(db, department_id)
+                    else:
+                        access_token = await self.auth_service.get_valid_access_token(db=db)
                 await self.onedrive_client.upload_file(
-                    access_token=await self._get_onedrive_access_token(),
+                    access_token=access_token,
                     local_path=autotag_report_obj,
-                    folder_path=OUTPUT_SUCCESS_FOLDER,
+                    folder_path=target_folder,
                     filename=autotag_report_obj.name,
                 )
-                logger.info("Upload success to OneDrive: local=%s target_folder=%s", autotag_report_obj, OUTPUT_SUCCESS_FOLDER)
-
-    async def _get_onedrive_access_token(self) -> str:
-        if not self.auth_service:
-            raise MicrosoftAuthError("Microsoft auth service is not initialized.")
-        async with SessionLocal() as db:
-            return await self.auth_service.get_valid_access_token(db=db)
+                logger.info("Upload success to OneDrive: local=%s target_folder=%s", autotag_report_obj, target_folder)
 
     @staticmethod
     def _is_processible_file(path: Path) -> tuple[bool, str]:

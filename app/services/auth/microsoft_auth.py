@@ -10,7 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.db.models import UserToken
+from app.db.models import DepartmentOAuthToken, UserToken
 
 import logging
 
@@ -34,23 +34,35 @@ class MicrosoftTokenPayload:
     user_email: str
 
 
+def _normalize_authorize_prompt(prompt: str) -> str:
+    """Entra rejects `login` + `select_account` together (AADSTS90023). Prefer account picker."""
+    tokens = [p for p in prompt.strip().split() if p]
+    lowered = {t.lower() for t in tokens}
+    if "login" in lowered and "select_account" in lowered:
+        return "select_account"
+    return " ".join(tokens)
+
+
 class MicrosoftAuthService:
     def __init__(self) -> None:
         if not settings.MS_CLIENT_ID or not settings.MS_CLIENT_SECRET:
             raise MicrosoftAuthError("Microsoft OAuth settings are incomplete.")
         self.authority_base = AUTH_BASE
 
-    def build_login_url(self, state: str) -> str:
-        query = urlencode(
-            {
-                "client_id": settings.MS_CLIENT_ID,
-                "response_type": "code",
-                "redirect_uri": settings.MS_REDIRECT_URI,
-                "response_mode": "query",
-                "scope": MS_OAUTH_SCOPE,
-                "state": state,
-            }
-        )
+    def build_login_url(self, state: str, *, prompt: str | None = None, login_hint: str | None = None) -> str:
+        params: dict[str, str] = {
+            "client_id": settings.MS_CLIENT_ID,
+            "response_type": "code",
+            "redirect_uri": settings.MS_REDIRECT_URI,
+            "response_mode": "query",
+            "scope": MS_OAUTH_SCOPE,
+            "state": state,
+        }
+        if prompt:
+            params["prompt"] = _normalize_authorize_prompt(prompt)
+        if login_hint and login_hint.strip():
+            params["login_hint"] = login_hint.strip()
+        query = urlencode(params)
         return f"{self.authority_base}/authorize?{query}"
 
     @staticmethod
@@ -78,7 +90,46 @@ class MicrosoftAuthService:
         }
         return await self._request_token(body=body, require_identity_claims=False)
 
-    async def get_valid_access_token(self, db: AsyncSession) -> str:
+    async def get_valid_token_for_dept(self, db: AsyncSession, department_id: str) -> str:
+        token_row = (
+            (await db.execute(select(DepartmentOAuthToken).where(DepartmentOAuthToken.department_id == department_id)))
+            .scalars()
+            .first()
+        )
+        if not token_row:
+            raise MicrosoftAuthError(f"No Microsoft token for department {department_id}. Connect OAuth first.")
+
+        now = datetime.now(UTC)
+        expires_at = self._as_utc(token_row.expires_at)
+        if expires_at > (now + timedelta(seconds=TOKEN_EXPIRY_BUFFER_SECONDS)):
+            return token_row.access_token
+
+        refreshed = await self.refresh_access_token(token_row.refresh_token)
+        token_row.access_token = refreshed.access_token
+        token_row.refresh_token = refreshed.refresh_token
+        token_row.expires_at = refreshed.expires_at
+        if refreshed.tenant_id:
+            token_row.tenant_id = refreshed.tenant_id
+        if refreshed.user_email:
+            token_row.connected_email = refreshed.user_email
+        db.add(token_row)
+        await db.commit()
+        await db.refresh(token_row)
+        return token_row.access_token
+
+    async def get_valid_access_token(self, db: AsyncSession, *, department_id: str | None = None) -> str:
+        if department_id:
+            return await self.get_valid_token_for_dept(db, department_id)
+        dept_row = (
+            (await db.execute(select(DepartmentOAuthToken).order_by(DepartmentOAuthToken.updated_at.desc())))
+            .scalars()
+            .first()
+        )
+        if dept_row:
+            return await self.get_valid_token_for_dept(db, dept_row.department_id)
+        return await self._get_valid_legacy_user_token(db)
+
+    async def _get_valid_legacy_user_token(self, db: AsyncSession) -> str:
         token_row = (await db.execute(select(UserToken).order_by(UserToken.updated_at.desc()))).scalars().first()
         if not token_row:
             raise MicrosoftAuthError("No Microsoft token found. Complete /auth/login first.")
@@ -101,12 +152,17 @@ class MicrosoftAuthService:
         await db.refresh(token_row)
         return token_row.access_token
 
-    async def save_tokens(self, db: AsyncSession, payload: MicrosoftTokenPayload) -> None:
-        token_row = (await db.execute(select(UserToken).where(UserToken.user_email == payload.user_email))).scalars().first()
+    async def save_tokens_for_department(self, db: AsyncSession, department_id: str, payload: MicrosoftTokenPayload) -> None:
+        token_row = (
+            (await db.execute(select(DepartmentOAuthToken).where(DepartmentOAuthToken.department_id == department_id)))
+            .scalars()
+            .first()
+        )
         if token_row is None:
-            token_row = UserToken(
+            token_row = DepartmentOAuthToken(
+                department_id=department_id,
                 provider="microsoft",
-                user_email=payload.user_email,
+                connected_email=payload.user_email,
                 tenant_id=payload.tenant_id,
                 access_token=payload.access_token,
                 refresh_token=payload.refresh_token,
@@ -114,7 +170,7 @@ class MicrosoftAuthService:
             )
         else:
             token_row.provider = "microsoft"
-            token_row.user_email = payload.user_email
+            token_row.connected_email = payload.user_email
             token_row.tenant_id = payload.tenant_id
             token_row.access_token = payload.access_token
             token_row.refresh_token = payload.refresh_token

@@ -16,7 +16,7 @@ class DocumentServiceError(Exception):
     pass
 
 
-async def upload_document(file: UploadFile, db: AsyncSession) -> Document:
+async def upload_document(file: UploadFile, db: AsyncSession, department_id: str | None = None) -> Document:
     if settings.STORAGE_PROVIDER == "onedrive":
         raise DocumentServiceError("Local upload storage is disabled in OneDrive-only mode.")
 
@@ -46,6 +46,7 @@ async def upload_document(file: UploadFile, db: AsyncSession) -> Document:
         id=document_id,
         filename=stored_filename,
         status=DocumentStatus.UPLOADED,
+        department_id=department_id,
     )
 
     try:
@@ -63,12 +64,18 @@ async def upload_document(file: UploadFile, db: AsyncSession) -> Document:
     return document
 
 
-async def list_documents(db: AsyncSession) -> list[Document]:
-    return (await db.execute(select(Document).order_by(Document.created_at.desc()))).scalars().all()
+async def list_documents(db: AsyncSession, department_id: str | None) -> list[Document]:
+    stmt = select(Document).order_by(Document.created_at.desc())
+    if department_id:
+        stmt = stmt.where(Document.department_id == department_id)
+    return (await db.execute(stmt)).scalars().all()
 
 
-async def get_document_by_id(document_id: str, db: AsyncSession) -> Document:
-    document = (await db.execute(select(Document).where(Document.id == document_id))).scalars().first()
+async def get_document_by_id(document_id: str, db: AsyncSession, department_id: str | None) -> Document:
+    stmt = select(Document).where(Document.id == document_id)
+    if department_id:
+        stmt = stmt.where(Document.department_id == department_id)
+    document = (await db.execute(stmt)).scalars().first()
     if not document:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

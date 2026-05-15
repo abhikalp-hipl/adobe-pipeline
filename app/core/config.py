@@ -37,7 +37,14 @@ class Settings:
     MS_TENANT_ID: str = _str_from_env("MS_TENANT_ID", "")
     MS_REDIRECT_URI: str = _str_from_env("MS_REDIRECT_URI", "http://localhost:8000/auth/callback")
     FRONTEND_DASHBOARD_URL: str = _str_from_env("FRONTEND_DASHBOARD_URL", "http://localhost:5173/dashboard")
+    FRONTEND_ADMIN_URL: str = _str_from_env("FRONTEND_ADMIN_URL", "http://localhost:5173/admin")
+    MS_DEPT_OAUTH_PROMPT: str = _str_from_env("MS_DEPT_OAUTH_PROMPT", "select_account")
     MAX_PDF_SIZE_MB: int = _int_from_env("MAX_PDF_SIZE_MB", 100)
+    JWT_SECRET: str = _str_from_env("JWT_SECRET", "dev-insecure-change-me")
+    JWT_ALGORITHM: str = "HS256"
+    JWT_EXPIRE_MINUTES: int = _int_from_env("JWT_EXPIRE_MINUTES", 60 * 24)
+    SUPER_ADMIN_USERNAME: str = _str_from_env("SUPER_ADMIN_USERNAME", "admin")
+    SUPER_ADMIN_PASSWORD: str = _str_from_env("SUPER_ADMIN_PASSWORD", "changeme")
 
 
 settings = Settings()

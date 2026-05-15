@@ -277,14 +277,20 @@ async def ensure_folder(path: str, access_token: str, timeout_seconds: int = 30)
             )
 
 
-async def ensure_pipeline_folders(access_token: str, timeout_seconds: int = 30) -> None:
-    folders = [
-        "AdobePipeline",
-        INTAKE_FOLDER,
-        PROCESSED_FOLDER,
-        OUTPUT_SUCCESS_FOLDER,
-        OUTPUT_FAILURE_FOLDER,
-    ]
+async def ensure_pipeline_folders(
+    access_token: str,
+    timeout_seconds: int = 30,
+    *,
+    intake_folder: str | None = None,
+    processed_folder: str | None = None,
+    output_success_folder: str | None = None,
+    output_failure_folder: str | None = None,
+) -> None:
+    intake = intake_folder or INTAKE_FOLDER
+    processed = processed_folder or PROCESSED_FOLDER
+    success = output_success_folder or OUTPUT_SUCCESS_FOLDER
+    failure = output_failure_folder or OUTPUT_FAILURE_FOLDER
+    folders = [intake, processed, success, failure]
     for folder in folders:
         try:
             await ensure_folder(folder, access_token, timeout_seconds=timeout_seconds)

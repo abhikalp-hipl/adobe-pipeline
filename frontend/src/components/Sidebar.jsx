@@ -1,5 +1,5 @@
 import React from "react";
-import { LayoutDashboard, FileClock, Folder } from "lucide-react";
+import { LayoutDashboard, FileClock, Folder, Settings, Shield } from "lucide-react";
 
 const FOLDERS = [
   { key: "intake", label: "Intake" },
@@ -15,6 +15,7 @@ export default function Sidebar({
   setSelectedFolder,
   folderCounts,
   onFolderSelect,
+  userRole,
 }) {
   return (
     <aside className="w-72 bg-gray-900 text-white h-full flex flex-col">
@@ -30,6 +31,32 @@ export default function Sidebar({
           <button type="button" className={`sidebar-item ${activePage === "runs" ? "sidebar-active" : ""}`} onClick={() => setActivePage("runs")}>
             <span className="flex items-center gap-2"><FileClock size={16} />Runs</span>
           </button>
+          {userRole === "super_admin" && (
+            <button
+              type="button"
+              className="sidebar-item w-full text-left"
+              onClick={() => {
+                window.location.href = "/admin";
+              }}
+            >
+              <span className="flex items-center gap-2">
+                <Shield size={16} />
+                Admin panel
+              </span>
+            </button>
+          )}
+          {userRole === "dept_user" && (
+            <button
+              type="button"
+              className={`sidebar-item w-full text-left ${activePage === "dept-settings" ? "sidebar-active" : ""}`}
+              onClick={() => setActivePage("dept-settings")}
+            >
+              <span className="flex items-center gap-2">
+                <Settings size={16} />
+                Department settings
+              </span>
+            </button>
+          )}
         </div>
         <p className="text-xs text-gray-400 mt-4 mb-2 px-3 tracking-wide">FOLDERS</p>
         <div className="px-2 space-y-1 pb-4">
