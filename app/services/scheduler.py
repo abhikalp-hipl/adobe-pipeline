@@ -33,6 +33,7 @@ from app.db.models import (
 )
 from app.services.auth.microsoft_auth import MicrosoftAuthError, MicrosoftAuthService
 from app.services.email_service import EmailServiceError, send_email
+from app.services.pdf.accessibility_xlsx import stamp_department_metadata
 from app.services.email_templates import build_eod_summary_email, build_pipeline_email
 from app.services.orchestrator import Orchestrator, OrchestratorError
 from app.services.storage.onedrive import (
@@ -61,6 +62,19 @@ GENERATED_ARTIFACT_SUFFIXES = (
     ".autotag-report.xlsx",
 )
 
+_GLOBAL_STATUS_KEY = "__global__"
+
+
+def _empty_pipeline_status() -> dict[str, object]:
+    return {
+        "is_running": False,
+        "current_step": None,
+        "current_file": None,
+        "progress": 0,
+        "error": None,
+        "failed_step": None,
+    }
+
 
 class Scheduler:
     def __init__(self, interval: int | None = None, status_listener: Callable[[dict[str, object]], None] | None = None) -> None:
@@ -80,17 +94,49 @@ class Scheduler:
         self.last_failure: dict | None = None
         self._status_listener = status_listener
         self._status_lock = threading.Lock()
+        self._dept_running_lock = threading.Lock()
+        self._dept_running: set[str] = set()
+        self._dept_status: dict[str, dict[str, object]] = {}
         self._ensured_dept_folders: set[str] = set()
-        self.pipeline_status: dict[str, object] = {
-            "is_running": False,
-            "current_step": None,
-            "current_file": None,
-            "progress": 0,
-            "error": None,
-            "failed_step": None,
-        }
 
-    def _record_failure(self, *, filename: str, failed_step: str, error: str, progress: int) -> None:
+    @staticmethod
+    def _status_key(department_id: str | None) -> str:
+        return department_id or _GLOBAL_STATUS_KEY
+
+    def _get_or_create_dept_status(self, department_id: str | None) -> dict[str, object]:
+        key = self._status_key(department_id)
+        with self._status_lock:
+            if key not in self._dept_status:
+                self._dept_status[key] = _empty_pipeline_status()
+            return self._dept_status[key]
+
+    def is_department_running(self, department_id: str) -> bool:
+        key = self._status_key(department_id)
+        with self._dept_running_lock:
+            return key in self._dept_running
+
+    def _try_acquire_department_run(self, department_id: str | None) -> bool:
+        key = self._status_key(department_id)
+        with self._dept_running_lock:
+            if key in self._dept_running:
+                return False
+            self._dept_running.add(key)
+            return True
+
+    def _release_department_run(self, department_id: str | None) -> None:
+        key = self._status_key(department_id)
+        with self._dept_running_lock:
+            self._dept_running.discard(key)
+
+    def _record_failure(
+        self,
+        *,
+        department_id: str | None,
+        filename: str,
+        failed_step: str,
+        error: str,
+        progress: int,
+    ) -> None:
         self.last_failure = {
             "at": datetime.now(UTC),
             "current_file": filename,
@@ -99,6 +145,7 @@ class Scheduler:
             "progress": progress,
         }
         self._set_pipeline_status(
+            department_id,
             current_step="FAILED",
             current_file=filename,
             progress=int(max(0, min(100, progress))),
@@ -106,19 +153,23 @@ class Scheduler:
             failed_step=failed_step,
         )
 
-    def _set_pipeline_status(self, **updates: object) -> None:
+    def _set_pipeline_status(self, department_id: str | None, **updates: object) -> None:
+        key = self._status_key(department_id)
         snapshot: dict[str, object]
         with self._status_lock:
-            self.pipeline_status.update(updates)
-            snapshot = dict(self.pipeline_status)
+            if key not in self._dept_status:
+                self._dept_status[key] = _empty_pipeline_status()
+            self._dept_status[key].update(updates)
+            snapshot = dict(self._dept_status[key])
         if self._status_listener:
             try:
                 self._status_listener(snapshot)
             except Exception:
                 logger.exception("Failed to publish pipeline status update")
 
-    def _mark_pipeline_started(self) -> None:
+    def _mark_pipeline_started(self, department_id: str | None) -> None:
         self._set_pipeline_status(
+            department_id,
             is_running=True,
             current_step="RUNNING",
             current_file=None,
@@ -127,8 +178,9 @@ class Scheduler:
             failed_step=None,
         )
 
-    def _mark_pipeline_progress(self, *, filename: str, progress: int) -> None:
+    def _mark_pipeline_progress(self, *, department_id: str | None, filename: str, progress: int) -> None:
         self._set_pipeline_status(
+            department_id,
             is_running=True,
             current_step="RUNNING",
             current_file=filename,
@@ -137,17 +189,22 @@ class Scheduler:
             failed_step=None,
         )
 
-    def _mark_pipeline_finished(self, *, success: bool) -> None:
+    def _mark_pipeline_finished(self, department_id: str | None, *, success: bool) -> None:
         self._set_pipeline_status(
+            department_id,
             is_running=False,
             current_step="COMPLETED" if success else "FAILED",
             current_file=None,
             progress=0,
         )
 
-    def get_pipeline_status(self) -> dict[str, object]:
+    def get_pipeline_status(self, department_id: str | None = None) -> dict[str, object]:
+        key = self._status_key(department_id)
         with self._status_lock:
-            return dict(self.pipeline_status)
+            status = self._dept_status.get(key)
+            if status is None:
+                return _empty_pipeline_status()
+            return dict(status)
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -200,8 +257,8 @@ class Scheduler:
                         "Manual run skipped: department_id=%s has no Microsoft OAuth connected.",
                         department_id,
                     )
-                    self._mark_pipeline_started()
-                    self._mark_pipeline_finished(success=True)
+                    self._mark_pipeline_started(department_id)
+                    self._mark_pipeline_finished(department_id, success=True)
                     return
                 await self._run_pipeline_for_department(department_id=department_id)
                 return
@@ -210,105 +267,128 @@ class Scheduler:
                 dept_ids = list((await db.execute(select(DepartmentOAuthToken.department_id))).scalars().all())
             if not dept_ids:
                 logger.warning("No departments with Microsoft OAuth connected; scheduler run skipped.")
-                self._mark_pipeline_started()
-                self._mark_pipeline_finished(success=True)
                 return
-            for dept_id in dept_ids:
-                await self._run_pipeline_for_department(department_id=dept_id)
+            results = await asyncio.gather(
+                *[self._run_pipeline_for_department(department_id=dept_id) for dept_id in dept_ids],
+                return_exceptions=True,
+            )
+            for dept_id, result in zip(dept_ids, results, strict=True):
+                if isinstance(result, Exception):
+                    logger.exception(
+                        "Background scheduler department run failed: department_id=%s",
+                        dept_id,
+                        exc_info=result,
+                    )
             return
         await self._run_pipeline_for_department(department_id=department_id)
 
-    async def _run_pipeline_for_department(self, department_id: str | None) -> bool:
-        self._mark_pipeline_started()
-        run_id = str(uuid.uuid4())
-        started_at = datetime.now(UTC)
-        logger.info("Manual scheduler run started: run_id=%s department_id=%s", run_id, department_id or "n/a")
-        run_db_id = await self._create_pipeline_run(run_id=run_id, start_time=started_at, department_id=department_id)
+    def schedule_department_run_now(self, department_id: str) -> bool:
+        """Acquire the dept lock, mark running, and start the pipeline in the background."""
+        if not self._try_acquire_department_run(department_id):
+            return False
+        self._mark_pipeline_started(department_id)
+        asyncio.create_task(
+            self._run_pipeline_for_department(department_id=department_id, lock_already_held=True)
+        )
+        return True
 
-        files_summary: list[dict[str, object]] = []
-        access_passed = 0
-        access_failed = 0
-        access_manual = 0
-        total_processed = 0
-        total_failed = 0
-        total_skipped = 0
-        run_failed = False
+    async def _run_pipeline_for_department(self, department_id: str | None, *, lock_already_held: bool = False) -> bool:
+        if not lock_already_held:
+            if not self._try_acquire_department_run(department_id):
+                logger.info(
+                    "Pipeline run skipped: department_id=%s already running.",
+                    department_id or "n/a",
+                )
+                return False
 
         try:
-            run_result = await self._drain_intake_for_run(department_id=department_id)
-            files_summary = run_result.get("files", [])
-            access = run_result.get("accessibility", {})
-            access_passed = int(access.get("passed", 0))
-            access_failed = int(access.get("failed", 0))
-            access_manual = int(access.get("manual", 0))
-            total_processed = int(run_result.get("processed", 0))
-            total_failed = int(run_result.get("failed", 0))
-            total_skipped = int(run_result.get("skipped", 0))
-        except Exception:
-            run_failed = True
-            raise
-        finally:
-            finished_at = datetime.now(UTC)
-            duration = self._format_duration(finished_at - started_at)
-            total_files = len(files_summary)
-            success_count = sum(1 for item in files_summary if item.get("status") == DocumentStatus.COMPLETED.value)
-            failure_count = sum(1 for item in files_summary if item.get("status") == DocumentStatus.FAILED.value)
-            final_status = PipelineRunStatus.FAILED if run_failed else PipelineRunStatus.COMPLETED
+            if not lock_already_held:
+                self._mark_pipeline_started(department_id)
+            run_id = str(uuid.uuid4())
+            started_at = datetime.now(UTC)
+            logger.info("Manual scheduler run started: run_id=%s department_id=%s", run_id, department_id or "n/a")
+            run_db_id = await self._create_pipeline_run(run_id=run_id, start_time=started_at, department_id=department_id)
 
-            if run_db_id:
-                await self._store_pipeline_run_files(run_db_id=run_db_id, files_summary=files_summary)
-                await self._finalize_pipeline_run(
-                    run_db_id=run_db_id,
-                    end_time=finished_at,
-                    duration=duration,
-                    total_files=total_files,
-                    success_count=success_count,
-                    failure_count=failure_count,
-                    status=final_status,
-                )
-
-            run_data = {
-                "run_id": run_id,
-                "duration": duration,
-                "total_files": total_files,
-                "success_count": success_count,
-                "failure_count": failure_count,
-                "total_processed": total_processed,
-                "total_failed": total_failed,
-                "total_skipped": total_skipped,
-                "files": files_summary,
-                "passed": access_passed,
-                "failed": access_failed,
-                "manual": access_manual,
-                "dashboard_url": settings.FRONTEND_DASHBOARD_URL,
-            }
+            files_summary: list[dict[str, object]] = []
+            access_passed = 0
+            access_failed = 0
+            access_manual = 0
+            run_failed = False
 
             try:
-                recipient_emails = await self._get_notification_emails(department_id=department_id)
-                if not recipient_emails:
-                    logger.info("Skipping email notification (no configured recipients): run_id=%s", run_id)
-                else:
-                    if failure_count == 0:
-                        subject = f"✅ Pipeline Completed | {total_files} Files"
-                    else:
-                        subject = f"❌ Pipeline Completed with Errors | {failure_count} Failed"
-                    html_content = build_pipeline_email(run_data)
-                    for recipient in recipient_emails:
-                        await send_email(to_email=recipient, subject=subject, html_content=html_content)
-                    logger.info(
-                        "Pipeline summary email sent: run_id=%s recipients=%s",
-                        run_id,
-                        ",".join(recipient_emails),
-                    )
-            except EmailServiceError:
-                logger.exception("Email notification failed: run_id=%s", run_id)
+                run_result = await self._drain_intake_for_run(department_id=department_id)
+                files_summary = run_result.get("files", [])
+                access = run_result.get("accessibility", {})
+                access_passed = int(access.get("passed", 0))
+                access_failed = int(access.get("failed", 0))
+                access_manual = int(access.get("manual", 0))
             except Exception:
-                logger.exception("Unexpected error while sending email: run_id=%s", run_id)
+                run_failed = True
+                raise
+            finally:
+                finished_at = datetime.now(UTC)
+                duration = self._format_duration(finished_at - started_at)
+                total_files = len(files_summary)
+                success_count = sum(1 for item in files_summary if item.get("status") == DocumentStatus.COMPLETED.value)
+                failure_count = sum(1 for item in files_summary if item.get("status") == DocumentStatus.FAILED.value)
+                final_status = PipelineRunStatus.FAILED if run_failed else PipelineRunStatus.COMPLETED
 
-            self._mark_pipeline_finished(success=not run_failed)
-            logger.info("Manual scheduler run finished: run_id=%s duration=%s", run_id, duration)
+                if run_db_id:
+                    await self._store_pipeline_run_files(run_db_id=run_db_id, files_summary=files_summary)
+                    await self._finalize_pipeline_run(
+                        run_db_id=run_db_id,
+                        end_time=finished_at,
+                        duration=duration,
+                        total_files=total_files,
+                        success_count=success_count,
+                        failure_count=failure_count,
+                        status=final_status,
+                    )
 
-        return run_failed
+                department_name = await Scheduler._get_department_name(department_id)
+                run_data = {
+                    "run_id": run_id,
+                    "duration": duration,
+                    "department_name": department_name,
+                    "total_files": total_files,
+                    "success_count": success_count,
+                    "failure_count": failure_count,
+                    "files": files_summary,
+                    "passed": access_passed,
+                    "failed": access_failed,
+                    "manual": access_manual,
+                    "dashboard_url": settings.FRONTEND_DASHBOARD_URL,
+                }
+
+                try:
+                    recipient_emails = await self._get_notification_emails(department_id=department_id)
+                    if not recipient_emails:
+                        logger.info("Skipping email notification (no configured recipients): run_id=%s", run_id)
+                    else:
+                        dept_label = department_name
+                        if failure_count == 0:
+                            subject = f"{dept_label} ✅ Pipeline Completed | {total_files} Files"
+                        else:
+                            subject = f"{dept_label} ❌ Pipeline Completed with Errors | {failure_count} Failed"
+                        html_content = build_pipeline_email(run_data)
+                        for recipient in recipient_emails:
+                            await send_email(to_email=recipient, subject=subject, html_content=html_content)
+                        logger.info(
+                            "Pipeline summary email sent: run_id=%s recipients=%s",
+                            run_id,
+                            ",".join(recipient_emails),
+                        )
+                except EmailServiceError:
+                    logger.exception("Email notification failed: run_id=%s", run_id)
+                except Exception:
+                    logger.exception("Unexpected error while sending email: run_id=%s", run_id)
+
+                self._mark_pipeline_finished(department_id, success=not run_failed)
+                logger.info("Manual scheduler run finished: run_id=%s duration=%s", run_id, duration)
+
+            return run_failed
+        finally:
+            self._release_department_run(department_id)
 
     def _run_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -335,7 +415,7 @@ class Scheduler:
                 logger.exception("EOD summary check failed")
             self._stop_event.wait(60)
 
-    def _poll_local_intake_folder(self) -> dict:
+    def _poll_local_intake_folder(self, *, department_id: str | None = None) -> dict:
         candidate_files: list[Path] = []
         for path in sorted(INTAKE_DIR.iterdir(), key=lambda item: item.name.lower()):
             is_processible, reason = self._is_processible_file(path)
@@ -368,10 +448,11 @@ class Scheduler:
         for index, file_path in enumerate(process_batch):
             total_files = max(1, len(process_batch))
             self._mark_pipeline_progress(
+                department_id=department_id,
                 filename=file_path.name,
                 progress=int((index / total_files) * 100),
             )
-            result = self._register_and_trigger(file_path=file_path, source_id=None)
+            result = self._register_and_trigger(file_path=file_path, source_id=None, department_id=department_id)
             if result:
                 processed_count += 1
                 rp = str(result.get("report_path") or "")
@@ -419,7 +500,7 @@ class Scheduler:
             if self.storage_provider == "onedrive":
                 cycle_result = await self.process_onedrive_intake(department_id=department_id)
             elif self.storage_provider == "local":
-                cycle_result = self._poll_local_intake_folder()
+                cycle_result = self._poll_local_intake_folder(department_id=department_id)
             else:
                 raise RuntimeError(
                     f"Unsupported storage provider '{self.storage_provider}'. "
@@ -594,6 +675,7 @@ class Scheduler:
             filename = Path(remote_file["name"]).name
             total_files = max(1, len(process_batch))
             self._mark_pipeline_progress(
+                department_id=department_id,
                 filename=filename,
                 progress=int((index / total_files) * 100),
             )
@@ -673,6 +755,8 @@ class Scheduler:
         file_path: Path,
         source_id: str | None,
         original_filename: str | None = None,
+        *,
+        department_id: str | None = None,
     ) -> dict[str, str] | None:
         display_filename = original_filename or file_path.name
         filename = file_path.name
@@ -680,7 +764,16 @@ class Scheduler:
         async with SessionLocal() as db:
             try:
                 dedupe_key = source_id or filename
-                existing = (await db.execute(select(Document).where(Document.filename == dedupe_key))).scalars().first()
+                if department_id:
+                    existing = (
+                        await db.execute(
+                            select(Document).where(
+                                and_(Document.filename == dedupe_key, Document.department_id == department_id)
+                            )
+                        )
+                    ).scalars().first()
+                else:
+                    existing = (await db.execute(select(Document).where(Document.filename == dedupe_key))).scalars().first()
                 if existing:
                     if existing.status == DocumentStatus.FAILED:
                         logger.info(
@@ -703,7 +796,11 @@ class Scheduler:
                         "report_path": "",
                     }
 
-                document = Document(filename=dedupe_key, status=DocumentStatus.UPLOADED)
+                document = Document(
+                    filename=dedupe_key,
+                    status=DocumentStatus.UPLOADED,
+                    department_id=department_id,
+                )
                 db.add(document)
                 await db.commit()
                 await db.refresh(document)
@@ -718,11 +815,21 @@ class Scheduler:
                 result = await orchestrator.process_document(document_id=document.id, input_path=file_path)
 
                 if self.storage_provider == "onedrive":
+                    output_success_folder = None
+                    if department_id:
+                        cfg = (
+                            await db.execute(
+                                select(DepartmentConfig).where(DepartmentConfig.department_id == department_id)
+                            )
+                        ).scalars().first()
+                        output_success_folder = cfg.output_success_folder if cfg else None
                     try:
                         await self._upload_onedrive_outputs(
                             tagged_pdf_path=result["tagged_pdf_path"],
                             report_path=result["report_path"],
                             autotag_report_path=result.get("autotag_report_path"),
+                            department_id=department_id,
+                            output_success_folder=output_success_folder,
                         )
                     except OneDriveError:
                         document.status = DocumentStatus.FAILED
@@ -755,6 +862,7 @@ class Scheduler:
                 failed_step = getattr(exc, "failed_step", "") or "unknown"
                 progress_map = {"fetch": 5, "convert_to_pdf": 30, "precheck": 45, "auto_tag": 60, "check_accessibility": 80}
                 self._record_failure(
+                    department_id=department_id,
                     filename=display_filename,
                     failed_step=failed_step,
                     error=str(exc) or "Pipeline failed.",
@@ -871,6 +979,7 @@ class Scheduler:
                 failed_step = getattr(exc, "failed_step", "") or "unknown"
                 progress_map = {"fetch": 5, "convert_to_pdf": 30, "precheck": 45, "auto_tag": 60, "check_accessibility": 80}
                 self._record_failure(
+                    department_id=department_id,
                     filename=original_filename,
                     failed_step=failed_step,
                     error=str(exc) or "Pipeline failed.",
@@ -938,6 +1047,16 @@ class Scheduler:
         except Exception:
             logger.exception("Failed to parse accessibility report summary: path=%s", report_path)
             return {"passed": 0, "failed": 0, "manual": 0}
+
+    @staticmethod
+    async def _get_department_name(department_id: str | None) -> str:
+        if not department_id:
+            return "Default"
+        async with SessionLocal() as db:
+            name = (
+                await db.execute(select(Department.name).where(Department.id == department_id))
+            ).scalar_one_or_none()
+        return (name or "").strip() or "Default"
 
     @staticmethod
     async def _get_notification_emails(department_id: str | None) -> list[str]:
@@ -1269,6 +1388,7 @@ class Scheduler:
         target_folder = output_success_folder or OUTPUT_SUCCESS_FOLDER
         tagged_path_obj = Path(tagged_pdf_path)
         report_path_obj = Path(report_path)
+        department_name = await Scheduler._get_department_name(department_id)
         async with SessionLocal() as db:
             if department_id:
                 access_token = await self.auth_service.get_valid_token_for_dept(db, department_id)
@@ -1296,6 +1416,7 @@ class Scheduler:
         if autotag_report_path:
             autotag_report_obj = Path(autotag_report_path)
             if autotag_report_obj.exists():
+                stamp_department_metadata(autotag_report_obj, department_name)
                 async with SessionLocal() as db:
                     if department_id:
                         access_token = await self.auth_service.get_valid_token_for_dept(db, department_id)

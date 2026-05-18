@@ -27,7 +27,9 @@ import {
   deleteEmailGroup,
   getFileContent,
   getFileContentArrayBuffer,
+  downloadAuthenticatedFile,
   fetchAuthenticatedFileBlobUrl,
+  openAuthenticatedFileInNewTab,
   fetchAuthenticatedPreviewPdfBlobUrl,
   revokeObjectUrl,
   getEmailGroup,
@@ -35,7 +37,6 @@ import {
   getRunFiles,
   getRuns,
   getSettings,
-  getFileUrl,
   getAccessibilityDetail,
   downloadAccessibilityReportXlsx,
   getScheduler,
@@ -383,6 +384,7 @@ function Dashboard({ initialActivePage = "dashboard" }) {
   const [isLoadingRunFiles, setIsLoadingRunFiles] = useState(false);
   const [runsPage, setRunsPage] = useState(1);
   const [isRunNowPending, setIsRunNowPending] = useState(false);
+  const [isPipelineRunning, setIsPipelineRunning] = useState(false);
   const [settings, setSettings] = useState({ eod_time: "14:00", enabled: false });
   const [eodTime, setEodTime] = useState("14:00");
   const [isSavingSettings, setIsSavingSettings] = useState(false);
@@ -394,6 +396,7 @@ function Dashboard({ initialActivePage = "dashboard" }) {
   const [accessibilityDetail, setAccessibilityDetail] = useState(null);
   const [isLoadingAccessibilityDetail, setIsLoadingAccessibilityDetail] = useState(false);
   const [isExportingAccessibilityReport, setIsExportingAccessibilityReport] = useState(false);
+  const [downloadingFileId, setDownloadingFileId] = useState(null);
   const [folderAccessibilityDetail, setFolderAccessibilityDetail] = useState(null);
   const [isLoadingFolderAccessibilityDetail, setIsLoadingFolderAccessibilityDetail] = useState(false);
   const activePageRef = useRef(activePage);
@@ -403,9 +406,11 @@ function Dashboard({ initialActivePage = "dashboard" }) {
   const folderFilesCacheRef = useRef(
     readSessionCache(scopedCacheKey(DASHBOARD_CACHE_KEYS.folderFilesByFolder), FOLDER_FILES_STORAGE_MAX_AGE_MS, {})
   );
+  const isRunNowPendingRef = useRef(false);
+  const hasSeenPipelineRunningRef = useRef(false);
 
   const intervalOptions = [1, 2, 5, 10, 15, 30, 60];
-  const showRunningState = isRunNowPending;
+  const showRunningState = isRunNowPending || isPipelineRunning;
 
   const refreshFolderCounts = useCallback(async () => {
     try {
@@ -550,6 +555,26 @@ function Dashboard({ initialActivePage = "dashboard" }) {
 
   useEffect(() => {
     let cancelled = false;
+    const syncPipelineRunning = async () => {
+      try {
+        const scheduler = await getScheduler();
+        if (!cancelled) {
+          setIsPipelineRunning(Boolean(scheduler?.pipeline_status?.is_running));
+        }
+      } catch {
+        if (!cancelled) {
+          setIsPipelineRunning(false);
+        }
+      }
+    };
+    syncPipelineRunning();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
     const loadDepartmentContext = async () => {
       try {
         const [dept, status] = await Promise.all([getDepartmentMe(), getDepartmentMicrosoftStatus()]);
@@ -649,6 +674,59 @@ function Dashboard({ initialActivePage = "dashboard" }) {
   useEffect(() => {
     refreshDashboard({ full: true });
   }, []);
+
+  useEffect(() => {
+    if (!isRunNowPending) {
+      return undefined;
+    }
+    let cancelled = false;
+    const pollPipelineStatus = async () => {
+      if (document.visibilityState === "hidden") {
+        return;
+      }
+      try {
+        const scheduler = await getScheduler();
+        if (cancelled) {
+          return;
+        }
+        const running = Boolean(scheduler?.pipeline_status?.is_running);
+        setIsPipelineRunning(running);
+        if (running) {
+          hasSeenPipelineRunningRef.current = true;
+        }
+        if (
+          !running &&
+          isRunNowPendingRef.current &&
+          hasSeenPipelineRunningRef.current
+        ) {
+          isRunNowPendingRef.current = false;
+          hasSeenPipelineRunningRef.current = false;
+          setIsRunNowPending(false);
+          setIsPipelineRunning(false);
+          setSuccess({ file: "" });
+          refreshDashboard();
+          refreshFolderCounts();
+          if (activePageRef.current === "folder") {
+            refreshSelectedFolderFiles(selectedFolderRef.current, { force: true });
+          }
+        }
+      } catch {
+        if (!cancelled && isRunNowPendingRef.current) {
+          setError("Failed to fetch pipeline status.");
+          isRunNowPendingRef.current = false;
+          hasSeenPipelineRunningRef.current = false;
+          setIsRunNowPending(false);
+          setIsPipelineRunning(false);
+        }
+      }
+    };
+    pollPipelineStatus();
+    const timer = window.setInterval(pollPipelineStatus, 3000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [isRunNowPending, refreshDashboard, refreshFolderCounts, refreshSelectedFolderFiles]);
 
   useEffect(() => {
     let cancelled = false;
@@ -908,19 +986,20 @@ function Dashboard({ initialActivePage = "dashboard" }) {
     intervalSeconds < 60;
 
   const handleRunNow = async () => {
+    setError("");
+    isRunNowPendingRef.current = true;
+    hasSeenPipelineRunningRef.current = false;
     setIsRunNowPending(true);
+    setIsPipelineRunning(false);
     try {
       await runNow();
-      setSuccess({ file: "" });
-      refreshDashboard();
-      refreshFolderCounts();
-      if (activePageRef.current === "folder") {
-        refreshSelectedFolderFiles(selectedFolderRef.current, { force: true });
-      }
+      hasSeenPipelineRunningRef.current = true;
     } catch (requestError) {
       setError(requestError?.response?.data?.detail || "Failed to start processing.");
-    } finally {
+      isRunNowPendingRef.current = false;
+      hasSeenPipelineRunningRef.current = false;
       setIsRunNowPending(false);
+      setIsPipelineRunning(false);
     }
   };
 
@@ -1024,6 +1103,39 @@ function Dashboard({ initialActivePage = "dashboard" }) {
       setDeletingEmailId("");
     }
   };
+
+  const handleDownloadFile = useCallback(async (fileId, fileName) => {
+    if (!fileId) {
+      return;
+    }
+    setDownloadingFileId(fileId);
+    setError("");
+    try {
+      await downloadAuthenticatedFile(fileId, fileName || "download");
+    } catch (requestError) {
+      const detail = requestError?.response?.data?.detail;
+      setError(
+        typeof detail === "string" ? detail : requestError?.message || "Failed to download file."
+      );
+    } finally {
+      setDownloadingFileId(null);
+    }
+  }, []);
+
+  const handleOpenFileInNewTab = useCallback(async (fileId) => {
+    if (!fileId) {
+      return;
+    }
+    setError("");
+    try {
+      await openAuthenticatedFileInNewTab(fileId);
+    } catch (requestError) {
+      const detail = requestError?.response?.data?.detail;
+      setError(
+        typeof detail === "string" ? detail : requestError?.message || "Failed to open file."
+      );
+    }
+  }, []);
 
   const handleDownloadAccessibilityXlsx = useCallback(async (pdfId, jsonId, jsonFileName) => {
     if (!pdfId || !jsonId) {
@@ -1480,7 +1592,17 @@ function Dashboard({ initialActivePage = "dashboard" }) {
                   </div>
                   <div className="hidden sm:flex gap-2 opacity-0 group-hover:opacity-100 transition">
                     <button type="button" onClick={(e) => { e.stopPropagation(); handleFileSelect(file); }} className="px-3 py-1.5 rounded bg-blue-600 hover:bg-blue-700 text-white text-sm">View</button>
-                    <a href={getFileUrl(file.id)} download={file.name} onClick={(e) => e.stopPropagation()} className="px-3 py-1.5 rounded bg-gray-800 hover:bg-gray-900 text-white text-sm">Download</a>
+                    <button
+                      type="button"
+                      disabled={downloadingFileId === file.id}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleDownloadFile(file.id, file.name);
+                      }}
+                      className="px-3 py-1.5 rounded bg-gray-800 hover:bg-gray-900 disabled:opacity-60 text-white text-sm"
+                    >
+                      {downloadingFileId === file.id ? "Downloading…" : "Download"}
+                    </button>
                   </div>
                 </div>
               ))}
@@ -1877,21 +1999,21 @@ function Dashboard({ initialActivePage = "dashboard" }) {
                   )}
                 </div>
                 <div className="flex gap-2">
-                  <a
-                    href={getFileUrl(selectedFile.id)}
-                    target="_blank"
-                    rel="noreferrer"
+                  <button
+                    type="button"
+                    onClick={() => handleOpenFileInNewTab(selectedFile.id)}
                     className="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1 rounded text-sm"
                   >
                     Open in New Tab
-                  </a>
-                  <a
-                    href={getFileUrl(selectedFile.id)}
-                    download={selectedFile.name}
-                    className="bg-gray-700 hover:bg-gray-800 text-white px-3 py-1 rounded text-sm"
+                  </button>
+                  <button
+                    type="button"
+                    disabled={downloadingFileId === selectedFile.id}
+                    onClick={() => handleDownloadFile(selectedFile.id, selectedFile.name)}
+                    className="bg-gray-700 hover:bg-gray-800 disabled:opacity-60 text-white px-3 py-1 rounded text-sm"
                   >
-                    Download
-                  </a>
+                    {downloadingFileId === selectedFile.id ? "Downloading…" : "Download"}
+                  </button>
                 </div>
               </div>
             )}

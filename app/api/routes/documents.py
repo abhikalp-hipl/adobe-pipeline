@@ -1,7 +1,7 @@
 import logging
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -9,7 +9,6 @@ from app.db.database import get_db
 from app.schemas.document import DocumentResponse
 from app.services.adobe.client import AdobeAPIError
 from app.services.auth.app_auth import CurrentUser, require_dept_user
-from app.services.auth.microsoft_auth import MicrosoftAuthError
 from app.services.document_service import (
     DocumentServiceError,
     get_document_by_id,
@@ -17,8 +16,6 @@ from app.services.document_service import (
     upload_document,
 )
 from app.services.orchestrator import DocumentNotFoundError, Orchestrator, OrchestratorError
-from app.services.scheduler import Scheduler
-from app.services.storage.onedrive import OneDriveAuthError, OneDriveError
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 logger = logging.getLogger(__name__)
@@ -80,7 +77,7 @@ async def process_document_endpoint(
     if settings.STORAGE_PROVIDER == "onedrive":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Manual local processing is disabled in OneDrive-only mode. Use /documents/onedrive/process-intake.",
+            detail="Manual local processing is disabled in OneDrive-only mode. Use scheduler run-now.",
         )
     logger.info("Process request received: document_id=%s", document_id)
     await get_document_by_id(document_id=document_id, db=db, department_id=user.department_id)
@@ -109,35 +106,3 @@ async def process_document_endpoint(
         ) from exc
 
 
-@router.post("/onedrive/process-intake")
-async def process_onedrive_intake_endpoint(
-    request: Request,
-    user: Annotated[CurrentUser, Depends(require_dept_user)],
-) -> dict[str, int]:
-    if settings.STORAGE_PROVIDER != "onedrive":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="OneDrive intake processing is only available when STORAGE_PROVIDER=onedrive.",
-        )
-
-    scheduler = getattr(request.app.state, "scheduler", None)
-    if not scheduler:
-        scheduler = Scheduler()
-    try:
-        return await scheduler.process_onedrive_intake(department_id=user.department_id)
-    except OneDriveAuthError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=str(exc),
-        ) from exc
-    except MicrosoftAuthError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=str(exc),
-        ) from exc
-    except OneDriveError as exc:
-        logger.exception("OneDrive intake processing failed")
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=str(exc),
-        ) from exc

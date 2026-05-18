@@ -1,4 +1,3 @@
-import asyncio
 import logging
 from pathlib import Path
 from urllib.parse import quote
@@ -297,9 +296,3 @@ async def ensure_pipeline_folders(
         except Exception:
             logger.exception("Failed to ensure OneDrive folder: path=%s", folder)
 
-
-def ensure_pipeline_folders_sync(access_token: str, timeout_seconds: int = 30) -> None:
-    try:
-        asyncio.run(ensure_pipeline_folders(access_token, timeout_seconds=timeout_seconds))
-    except Exception:
-        logger.exception("Failed to ensure required OneDrive pipeline folders.")

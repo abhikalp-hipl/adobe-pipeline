@@ -12,7 +12,6 @@ from app.api.routes.dept_auth import router as dept_auth_router
 from app.api.routes.documents import router as documents_router
 from app.api.routes.email_group import router as email_group_router
 from app.api.routes.files import router as files_router
-from app.api.routes.pipeline import router as pipeline_router
 from app.api.routes.runs import router as runs_router
 from app.api.routes.scheduler import router as scheduler_router
 from app.api.routes.settings import router as settings_router
@@ -58,6 +57,7 @@ async def on_startup() -> None:
     await _ensure_notification_settings_columns()
     await _ensure_pipeline_run_file_columns()
     await _ensure_multidepartment_columns()
+    await _ensure_document_filename_dept_unique()
     await _bootstrap_multidepartment_data()
     scheduler_interval = await _get_persisted_scheduler_interval_seconds()
     app.state.scheduler = Scheduler(interval=scheduler_interval)
@@ -73,7 +73,6 @@ def on_shutdown() -> None:
 
 app.include_router(documents_router)
 app.include_router(scheduler_router)
-app.include_router(pipeline_router)
 app.include_router(dept_auth_router)
 app.include_router(auth_router)
 app.include_router(admin_router)
@@ -179,6 +178,47 @@ async def _ensure_multidepartment_columns() -> None:
             existing = {row[1] for row in rows}
             if column not in existing:
                 await connection.execute(text(ddl))
+
+
+async def _ensure_document_filename_dept_unique() -> None:
+    """Replace global unique(filename) with composite unique(filename, department_id)."""
+    async with engine.begin() as connection:
+        rows = (await connection.execute(text("PRAGMA table_info(documents)"))).fetchall()
+        if not rows:
+            return
+        indexes = (await connection.execute(text("PRAGMA index_list(documents)"))).fetchall()
+        index_names = {row[1] for row in indexes}
+        if "uq_document_filename_dept" in index_names:
+            return
+        await connection.execute(
+            text(
+                """
+                CREATE TABLE documents_new (
+                    id VARCHAR(36) NOT NULL PRIMARY KEY,
+                    department_id VARCHAR(36),
+                    filename VARCHAR(512) NOT NULL,
+                    status VARCHAR NOT NULL,
+                    created_at DATETIME NOT NULL,
+                    updated_at DATETIME NOT NULL,
+                    FOREIGN KEY(department_id) REFERENCES departments (id),
+                    CONSTRAINT uq_document_filename_dept UNIQUE (filename, department_id)
+                )
+                """
+            )
+        )
+        await connection.execute(
+            text(
+                """
+                INSERT INTO documents_new (id, department_id, filename, status, created_at, updated_at)
+                SELECT id, department_id, filename, status, created_at, updated_at FROM documents
+                """
+            )
+        )
+        await connection.execute(text("DROP TABLE documents"))
+        await connection.execute(text("ALTER TABLE documents_new RENAME TO documents"))
+        await connection.execute(
+            text("CREATE INDEX IF NOT EXISTS ix_documents_department_id ON documents (department_id)")
+        )
 
 
 async def _bootstrap_multidepartment_data() -> None:

@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { ChevronDown, ChevronRight, Mail, Pencil, Plug, Trash2, XCircle } from "lucide-react";
 import {
   createAdminDepartment,
@@ -209,13 +209,17 @@ export default function AdminPanel() {
   const [editForm, setEditForm] = useState(null);
   const [editDistError, setEditDistError] = useState("");
   const [editLoading, setEditLoading] = useState(false);
+  const hasLoadedOnceRef = useRef(false);
 
   const load = useCallback(async () => {
     setError("");
-    setLoading(true);
+    if (!hasLoadedOnceRef.current) {
+      setLoading(true);
+    }
     try {
       const data = await getAdminDepartments();
       setRows(Array.isArray(data) ? data : []);
+      hasLoadedOnceRef.current = true;
     } catch (e) {
       setError(e?.response?.data?.detail || "Failed to load departments.");
     } finally {

@@ -8,7 +8,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from sqlalchemy import select
+
 from app.db.database import get_db
+from app.db.models import Department
 from app.services.auth.app_auth import CurrentUser, require_dept_user
 from app.services.auth.microsoft_auth import MicrosoftAuthError, MicrosoftAuthService
 from app.services.pdf.accessibility_xlsx import accessibility_report_to_xlsx_bytes
@@ -141,8 +144,15 @@ async def accessibility_detail_export(
         payload, tmp_path = await _load_json_report_and_stage_pdf(
             pdf_id, json_id, db, department_id=user.department_id
         )
+        department_name = (
+            await db.execute(select(Department.name).where(Department.id == user.department_id))
+        ).scalar_one_or_none()
+        department_name = (department_name or "").strip() or "Default"
+
         summary, rows = build_accessibility_export_rows(payload, tmp_path)
-        body = accessibility_report_to_xlsx_bytes(summary, rows)
+        summary_with_dept = {"Department": department_name, **summary}
+        body = accessibility_report_to_xlsx_bytes(summary_with_dept, rows)
+
         return Response(
             content=body,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",

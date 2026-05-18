@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from io import BytesIO
+from pathlib import Path
 from typing import Any
 
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font
 
 
@@ -43,3 +44,21 @@ def accessibility_report_to_xlsx_bytes(summary: dict[str, Any], rows: list[dict[
     buf = BytesIO()
     wb.save(buf)
     return buf.getvalue()
+
+
+def stamp_department_metadata(xlsx_path: str | Path, department_name: str) -> None:
+    """Add or update a Metadata sheet on an existing workbook (e.g. Adobe tagging report)."""
+    path = Path(xlsx_path)
+    if not path.is_file():
+        return
+    wb = load_workbook(path)
+    if "Metadata" in wb.sheetnames:
+        ws = wb["Metadata"]
+        ws.delete_rows(1, ws.max_row)
+    else:
+        ws = wb.create_sheet("Metadata", 0)
+    ws.cell(row=1, column=1, value="Field").font = Font(bold=True)
+    ws.cell(row=1, column=2, value="Value").font = Font(bold=True)
+    ws.cell(row=2, column=1, value="Department")
+    ws.cell(row=2, column=2, value=department_name or "Default")
+    wb.save(path)

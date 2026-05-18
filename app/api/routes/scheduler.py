@@ -1,4 +1,4 @@
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
@@ -17,6 +17,7 @@ class SchedulerStatusResponse(BaseModel):
     status: str
     provider: str
     automation_enabled: bool
+    pipeline_status: dict[str, Any] = Field(default_factory=dict)
 
 
 class SchedulerIntervalUpdateRequest(BaseModel):
@@ -38,13 +39,17 @@ def _get_scheduler(request: Request) -> Scheduler:
 
 
 @router.get("", response_model=SchedulerStatusResponse)
-async def get_scheduler_status(request: Request) -> SchedulerStatusResponse:
+async def get_scheduler_status(
+    request: Request,
+    user: Annotated[CurrentUser, Depends(require_dept_user)],
+) -> SchedulerStatusResponse:
     scheduler = _get_scheduler(request=request)
     return SchedulerStatusResponse(
         interval=scheduler.interval,
         status=scheduler.status(),
         provider=scheduler.storage_provider,
         automation_enabled=scheduler.automation_enabled,
+        pipeline_status=scheduler.get_pipeline_status(user.department_id),
     )
 
 
@@ -67,6 +72,7 @@ async def update_scheduler_interval(
         status=scheduler.status(),
         provider=scheduler.storage_provider,
         automation_enabled=scheduler.automation_enabled,
+        pipeline_status=scheduler.get_pipeline_status(user.department_id),
     )
 
 
@@ -75,8 +81,13 @@ async def run_scheduler_now(
     request: Request,
     user: Annotated[CurrentUser, Depends(require_dept_user)],
 ) -> RunNowResponse:
+    assert user.department_id
     scheduler = _get_scheduler(request=request)
-    await scheduler.run_once(department_id=user.department_id)
+    if not scheduler.schedule_department_run_now(user.department_id):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Pipeline is already running for this department.",
+        )
     return RunNowResponse(detail="Processing started")
 
 

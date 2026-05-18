@@ -89,7 +89,7 @@ export const updateScheduler = async (interval) => {
 };
 
 export const runNow = async () => {
-  const response = await api.post("/run-now");
+  const response = await api.post("/scheduler/run-now");
   return response.data;
 };
 
@@ -129,6 +129,27 @@ export const fetchAuthenticatedFileBlobUrl = async (id) => {
   const blob =
     response.data instanceof Blob ? response.data : new Blob([response.data], { type: contentType });
   return URL.createObjectURL(blob);
+};
+
+export const downloadAuthenticatedFile = async (id, filename = "download") => {
+  const blobUrl = await fetchAuthenticatedFileBlobUrl(id);
+  const anchor = document.createElement("a");
+  anchor.href = blobUrl;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  revokeObjectUrl(blobUrl);
+};
+
+export const openAuthenticatedFileInNewTab = async (id) => {
+  const blobUrl = await fetchAuthenticatedFileBlobUrl(id);
+  const opened = window.open(blobUrl, "_blank", "noopener,noreferrer");
+  if (!opened) {
+    revokeObjectUrl(blobUrl);
+    throw new Error("Popup blocked. Allow popups for this site to open the file.");
+  }
+  window.setTimeout(() => revokeObjectUrl(blobUrl), 60_000);
 };
 
 export const fetchAuthenticatedPreviewPdfBlobUrl = async (id) => {

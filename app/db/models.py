@@ -182,6 +182,9 @@ class SuperAdmin(Base):
 
 class Document(Base):
     __tablename__ = "documents"
+    __table_args__ = (
+        UniqueConstraint("filename", "department_id", name="uq_document_filename_dept"),
+    )
 
     id: Mapped[str] = mapped_column(
         String(36),
@@ -189,7 +192,7 @@ class Document(Base):
         default=lambda: str(uuid.uuid4()),
     )
     department_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("departments.id"), nullable=True, index=True)
-    filename: Mapped[str] = mapped_column(String(512), nullable=False, unique=True)
+    filename: Mapped[str] = mapped_column(String(512), nullable=False)
     status: Mapped[DocumentStatus] = mapped_column(
         Enum(DocumentStatus),
         nullable=False,

@@ -24,6 +24,7 @@ def build_pipeline_email(data: dict[str, Any]) -> str:
     </h2>
 
     <p style="color:#555;font-size:14px;">
+      Department: {esc(data.get('department_name') or 'Default')}<br/>
       Run ID: {esc(data.get('run_id'))}<br/>
       Duration: {esc(data.get('duration'))}
     </p>
